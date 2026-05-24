@@ -473,4 +473,24 @@ input[type=color]{
 }
 .live-toggle.on .live-thumb{transform:translateX(16px);}
 
+.history-row{
+  display:flex;gap:8px;
+  margin-top:10px;
+  padding:0 2px;
+}
+.btn-history{
+  flex:1;
+  font-family:'DM Mono',monospace;
+  font-size:11px;
+  padding:6px 10px;
+  background:var(--s3);
+  border:1px solid var(--border);
+  color:var(--muted);
+  border-radius:var(--r-sm);
+  cursor:pointer;
+  transition:all 0.15s;
+}
+.btn-history:hover:not(:disabled){border-color:var(--border2);color:var(--text);}
+.btn-history:disabled{color:var(--muted2);cursor:not-allowed;opacity:0.5;}
+
 #work-canvas{display:none;}

@@ -6,6 +6,61 @@ let selectedColor = '#000000';
 let liveEnabled = false;
 let liveTimer = null;
 
+// ── Undo/Redo history ─────────────────────────────────────────────────────
+const HISTORY_LIMIT = 20;
+let history = [];
+let historyIndex = -1;
+
+function pushHistory(snap) {
+  history = history.slice(0, historyIndex + 1);
+  history.push(snap);
+  if (history.length > HISTORY_LIMIT) history.shift();
+  historyIndex = history.length - 1;
+  updateHistoryButtons();
+}
+
+function applySnapshot(snap) {
+  document.getElementById('threshold').value = snap.threshold;
+  document.getElementById('v-threshold').textContent = snap.threshold;
+  document.getElementById('ltres').value = snap.ltres;
+  document.getElementById('v-ltres').textContent = parseFloat(snap.ltres).toFixed(1);
+  document.getElementById('qtres').value = snap.qtres;
+  document.getElementById('v-qtres').textContent = parseFloat(snap.qtres).toFixed(1);
+  document.getElementById('pathomit').value = snap.pathomit;
+  document.getElementById('v-pathomit').textContent = snap.pathomit;
+  document.getElementById('invert').value = snap.invert;
+  currentSVG = snap.svgString;
+  renderSVGTab(snap.svgString);
+  document.querySelector('[data-tab="svg"]').click();
+  setStatus('Restored — SVG ready ✓', 'ok');
+}
+
+function updateHistoryButtons() {
+  document.getElementById('undo-btn').disabled = historyIndex <= 0;
+  document.getElementById('redo-btn').disabled = historyIndex >= history.length - 1;
+}
+
+function undo() {
+  if (historyIndex <= 0) return;
+  historyIndex--;
+  applySnapshot(history[historyIndex]);
+  updateHistoryButtons();
+}
+
+function redo() {
+  if (historyIndex >= history.length - 1) return;
+  historyIndex++;
+  applySnapshot(history[historyIndex]);
+  updateHistoryButtons();
+}
+
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+  }
+});
+
 // ── Live update toggle ────────────────────────────────────────────────────
 const liveToggle = document.getElementById('live-toggle');
 liveToggle.addEventListener('click', () => {
@@ -169,6 +224,15 @@ document.getElementById('trace-btn').addEventListener('click', async () => {
 
     const cleaned = postProcess(svgStr, selectedColor, canvas.width, canvas.height);
     currentSVG = cleaned;
+
+    pushHistory({
+      threshold,
+      ltres,
+      qtres,
+      pathomit,
+      invert: document.getElementById('invert').value,
+      svgString: cleaned,
+    });
 
     renderSVGTab(cleaned);
     await renderExportsTab(cleaned);
