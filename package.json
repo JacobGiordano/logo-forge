@@ -1,0 +1,26 @@
+{
+  "name": "logo-forge",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "serve": "serve . -l 4321"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JacobGiordano/logo-forge.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/JacobGiordano/logo-forge/issues"
+  },
+  "homepage": "https://github.com/JacobGiordano/logo-forge#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "serve": "^14.2.6"
+  }
+}
