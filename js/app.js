@@ -292,8 +292,19 @@ function postProcess(svgStr, color, origW, origH) {
   const svg = doc.querySelector('svg');
   if (!svg) return svgStr;
 
-  svg.setAttribute('width', '100%');
-  svg.removeAttribute('height');
+  const vb = svg.getAttribute('viewBox');
+  if (vb) {
+    const parts = vb.trim().split(/[\s,]+/);
+    const vbW = parseFloat(parts[2]);
+    const vbH = parseFloat(parts[3]);
+    if (vbW && vbH) {
+      svg.setAttribute('width', vbW);
+      svg.setAttribute('height', vbH);
+    }
+  } else {
+    svg.removeAttribute('width');
+    svg.removeAttribute('height');
+  }
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
 
   const paths = Array.from(doc.querySelectorAll('path'));

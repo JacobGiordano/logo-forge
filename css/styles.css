@@ -359,7 +359,7 @@ input[type=color]{
 }
 .prev-card-body svg,.prev-card-body img{
   display:block;
-  width:100%;height:auto;
+  width:auto;height:auto;
   max-width:100%;max-height:180px;
   object-fit:contain;
 }
