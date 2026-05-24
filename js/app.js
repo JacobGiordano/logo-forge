@@ -292,7 +292,7 @@ function postProcess(svgStr, color, origW, origH) {
   const svg = doc.querySelector('svg');
   if (!svg) return svgStr;
 
-  svg.removeAttribute('width');
+  svg.setAttribute('width', '100%');
   svg.removeAttribute('height');
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
 
