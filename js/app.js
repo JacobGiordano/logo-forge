@@ -110,8 +110,12 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 // ── Color swatches ────────────────────────────────────────────────────────
 document.querySelectorAll('.color-swatch').forEach(sw => {
   sw.addEventListener('click', () => {
-    document.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
+    document.querySelectorAll('.color-swatch').forEach(s => {
+      s.classList.remove('active');
+      s.setAttribute('aria-pressed', 'false');
+    });
     sw.classList.add('active');
+    sw.setAttribute('aria-pressed', 'true');
     const val = sw.dataset.color;
     document.getElementById('custom-color-row').style.display = val === 'custom' ? 'flex' : 'none';
     if (val !== 'custom') selectedColor = val;
@@ -167,6 +171,12 @@ function autoDetect(img) {
 document.getElementById('invert').addEventListener('change', scheduleLive);
 
 const dz = document.getElementById('dropzone');
+dz.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    document.getElementById('file-input').click();
+  }
+});
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
 dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
 dz.addEventListener('drop', e => {
