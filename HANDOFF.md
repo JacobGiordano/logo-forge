@@ -2,15 +2,12 @@ Last updated: 2026-05-23
 
 ## Status
 
-Issue #2 (mobile layout + accessibility) complete and merged to main.
+Issue #3 (SVG preview cards blank on mobile) complete and merged to main.
 
 ## Decisions made this session
 
-- --muted bumped to #888898 (~5.7:1 contrast) — safely above WCAG AA 4.5:1
-- Responsive breakpoint at 768px (stack panels, single-column preview grid)
-- Color swatches converted to <button> elements with aria-pressed
-- Dropzone keyboard affordance via Enter/Space keydown handler
-- Hex label for= added (was pre-existing gap caught during verification)
+- Root cause: `postProcess` stripped `width`/`height` from inline SVG, causing mobile browsers to collapse it to 0×0 in a flex container
+- Fix: `width="100%"` on SVG element + CSS `display:block; width:100%; height:auto` + mobile `max-height:100%` override
 
 ## Next issues
 
