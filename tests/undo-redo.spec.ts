@@ -112,3 +112,9 @@ test('SVG result is shown after undo', async ({ page }) => {
   await expect(page.locator('#svg-result')).toBeVisible();
   await expect(page.locator('#status')).toHaveText('Restored — SVG ready ✓');
 });
+
+test('trace shows processed mask preview and richer diagnostics', async ({ page }) => {
+  await uploadAndTrace(page);
+  await expect(page.locator('#svg-meta')).toContainText('Threshold');
+  await expect(page.locator('#preview-grid')).toContainText('Processed mask');
+});
