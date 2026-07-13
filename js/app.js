@@ -134,23 +134,64 @@ function syncControlBadges() {
     const el = document.getElementById(id);
     const badge = document.getElementById(valueId);
     const value = parseFloat(el.value);
-    badge.textContent = value.toFixed(decimals);
+    badge.value = value.toFixed(decimals);
   });
+}
+
+function clampToSlider(rawValue, slider) {
+  const min = slider.min === '' ? -Infinity : parseFloat(slider.min);
+  const max = slider.max === '' ? Infinity : parseFloat(slider.max);
+  const step = slider.step && slider.step !== 'any' ? parseFloat(slider.step) : null;
+  let value = Number.isFinite(rawValue) ? rawValue : parseFloat(slider.value);
+
+  value = Math.max(min, Math.min(max, value));
+
+  if (step && Number.isFinite(step) && step > 0 && Number.isFinite(min)) {
+    const steps = Math.round((value - min) / step);
+    value = min + steps * step;
+  }
+
+  const precision = step && String(step).includes('.') ? String(step).split('.')[1].length : 0;
+  return Number(value.toFixed(precision));
+}
+
+function commitValueInput(slider, valueInput, decimals) {
+  const parsed = parseFloat(valueInput.value);
+  const clamped = clampToSlider(parsed, slider);
+  slider.value = String(clamped);
+  valueInput.value = clamped.toFixed(decimals);
+  scheduleLive();
 }
 
 CONTROL_DEFS.forEach(({ id, valueId, decimals }) => {
   const el = document.getElementById(id);
   if (valueId) {
     const badge = document.getElementById(valueId);
-    badge.textContent = parseFloat(el.value).toFixed(decimals);
+    badge.value = parseFloat(el.value).toFixed(decimals);
   }
   el.addEventListener('input', () => {
     if (valueId) {
-      document.getElementById(valueId).textContent = parseFloat(el.value).toFixed(decimals);
+      document.getElementById(valueId).value = parseFloat(el.value).toFixed(decimals);
     }
     scheduleLive();
   });
   el.addEventListener('change', scheduleLive);
+
+  if (valueId) {
+    const valueInput = document.getElementById(valueId);
+    valueInput.addEventListener('change', () => commitValueInput(el, valueInput, decimals));
+    valueInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        commitValueInput(el, valueInput, decimals);
+        valueInput.blur();
+      }
+      if (event.key === 'Escape') {
+        valueInput.value = parseFloat(el.value).toFixed(decimals);
+        valueInput.blur();
+      }
+    });
+  }
 });
 
 // ── Color swatches ────────────────────────────────────────────────────────
@@ -362,6 +403,8 @@ function preprocessImageData(imgData, settings, invert) {
     mask = smoothMask(mask, imgData.width, imgData.height, settings.cornerSmoothing - 1);
   }
 
+  mask = refineMaskEdges(mask, imgData.width, imgData.height, settings.cornerSmoothing);
+
   const filledPixels = countFilledPixels(mask);
   const imageData = maskToImageData(mask, imgData.width, imgData.height);
   const previewUrl = makePreviewURL(imageData);
@@ -466,6 +509,45 @@ function smoothMask(mask, width, height, passes) {
     current = next;
   }
   return current;
+}
+
+function morphMask(mask, width, height, mode, passes) {
+  let current = mask;
+  for (let pass = 0; pass < passes; pass++) {
+    const next = new Uint8Array(mask.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        let sum = 0;
+        let samples = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= height) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            if (nx < 0 || nx >= width) continue;
+            samples++;
+            sum += current[ny * width + nx];
+          }
+        }
+        next[idx] = mode === 'dilate' ? (sum > 0 ? 1 : 0) : (sum === samples ? 1 : 0);
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+
+function refineMaskEdges(mask, width, height, strength) {
+  if (strength < 2) return mask;
+  const passes = Math.max(1, Math.floor((strength - 1) / 2));
+  let refined = morphMask(mask, width, height, 'dilate', passes);
+  refined = morphMask(refined, width, height, 'erode', passes);
+  if (strength >= 3) {
+    refined = morphMask(refined, width, height, 'erode', 1);
+    refined = morphMask(refined, width, height, 'dilate', 1);
+  }
+  return refined;
 }
 
 function removeSmallComponents(mask, width, height, maxArea) {

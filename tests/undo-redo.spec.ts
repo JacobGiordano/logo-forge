@@ -56,7 +56,7 @@ test('undo restores slider values', async ({ page }) => {
   // Undo → should go back to threshold 100
   await page.locator('#undo-btn').click();
   await expect(page.locator('#threshold')).toHaveValue('100');
-  await expect(page.locator('#v-threshold')).toHaveText('100');
+  await expect(page.locator('#v-threshold')).toHaveValue('100');
 });
 
 test('redo restores slider values after undo', async ({ page }) => {
@@ -70,7 +70,7 @@ test('redo restores slider values after undo', async ({ page }) => {
   await page.locator('#redo-btn').click();
 
   await expect(page.locator('#threshold')).toHaveValue('200');
-  await expect(page.locator('#v-threshold')).toHaveText('200');
+  await expect(page.locator('#v-threshold')).toHaveValue('200');
 });
 
 test('new trace after undo clears redo history', async ({ page }) => {
@@ -117,4 +117,14 @@ test('trace shows processed mask preview and richer diagnostics', async ({ page 
   await uploadAndTrace(page);
   await expect(page.locator('#svg-meta')).toContainText('Threshold');
   await expect(page.locator('#preview-grid')).toContainText('Processed mask');
+});
+
+test('numeric value inputs update sliders on submit', async ({ page }) => {
+  await page.locator('#v-threshold-bias').fill('-26');
+  await page.locator('#v-threshold-bias').press('Enter');
+  await expect(page.locator('#threshold-bias')).toHaveValue('-26');
+
+  await page.locator('#v-curve-fit').fill('2.1');
+  await page.locator('#v-curve-fit').press('Enter');
+  await expect(page.locator('#curve-fit')).toHaveValue('2.1');
 });
