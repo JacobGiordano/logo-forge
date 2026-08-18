@@ -85,6 +85,16 @@
           <input type="range" id="path-simplify" min="0" max="24" step="1" value="9">
           <input type="number" class="val-input" id="v-path-simplify" data-slider="path-simplify" min="0" max="24" step="1" value="9">
         </div>
+        <div class="ctrl-subhead">Supersampling</div>
+        <div class="ctrl-row ctrl-row-select">
+          <label class="ctrl-label" for="upscale-factor">Upscale before trace</label>
+          <select id="upscale-factor">
+            <option value="1">Off</option>
+            <option value="2">2×</option>
+            <option value="3">3×</option>
+            <option value="4">4×</option>
+          </select>
+        </div>
         <div style="margin-top:4px">
           <select id="invert">
             <option value="auto">Auto-detect bg</option>
@@ -92,7 +102,7 @@
             <option value="1">Inverted (light logo, dark bg)</option>
           </select>
         </div>
-        <p class="ctrl-note">The new pipeline cleans the bitmap first, then traces cleaner silhouettes with fewer, smoother paths.</p>
+        <p class="ctrl-note">The new pipeline cleans the bitmap first, then traces cleaner silhouettes with fewer, smoother paths. Upscaling runs an edge-preserving Scale2x/3x pass on the cleaned mask before tracing for smoother curves, then scales the result back down to the source size.</p>
       </div>
     </div>
 
@@ -168,6 +178,7 @@
 
 <script src="js/imagetracer.js"></script>
 <script src="js/zip.js"></script>
+<script src="js/upscale.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

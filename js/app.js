@@ -17,6 +17,7 @@ const CONTROL_DEFS = [
   { id: 'corner-smoothing', valueId: 'v-corner-smoothing', decimals: 0 },
   { id: 'curve-fit', valueId: 'v-curve-fit', decimals: 1 },
   { id: 'path-simplify', valueId: 'v-path-simplify', decimals: 0 },
+  { id: 'upscale-factor', valueId: null, decimals: 0 },
   { id: 'invert', valueId: null, decimals: 0 },
 ];
 
@@ -43,6 +44,7 @@ function snapshotSettings() {
     cornerSmoothing: document.getElementById('corner-smoothing').value,
     curveFit: document.getElementById('curve-fit').value,
     pathSimplify: document.getElementById('path-simplify').value,
+    upscaleFactor: document.getElementById('upscale-factor').value,
     invert: document.getElementById('invert').value,
   };
 }
@@ -56,6 +58,7 @@ function applySettings(settings) {
   document.getElementById('corner-smoothing').value = settings.cornerSmoothing;
   document.getElementById('curve-fit').value = settings.curveFit;
   document.getElementById('path-simplify').value = settings.pathSimplify;
+  document.getElementById('upscale-factor').value = settings.upscaleFactor;
   document.getElementById('invert').value = settings.invert;
   syncControlBadges();
 }
@@ -361,6 +364,7 @@ function readSettings() {
     cornerSmoothing: parseInt(document.getElementById('corner-smoothing').value, 10),
     curveFit: parseFloat(document.getElementById('curve-fit').value),
     pathSimplify: parseInt(document.getElementById('path-simplify').value, 10),
+    upscaleFactor: parseInt(document.getElementById('upscale-factor').value, 10),
     invert: document.getElementById('invert').value,
   };
 }
@@ -405,17 +409,47 @@ function preprocessImageData(imgData, settings, invert) {
 
   mask = refineMaskEdges(mask, imgData.width, imgData.height, settings.cornerSmoothing);
 
+  // Coverage is measured on the natural-resolution mask, before any
+  // upscaling — despeckle/hole-preservation area thresholds above are
+  // already in natural-resolution mask-pixel units, so this keeps the
+  // reported ratio meaningful regardless of upscale factor.
   const filledPixels = countFilledPixels(mask);
-  const imageData = maskToImageData(mask, imgData.width, imgData.height);
+  const coverage = filledPixels / mask.length;
+
+  // Perceptual upscale (Scale2x/3x family, js/upscale.js) runs here — on
+  // the final cleaned binary mask, not the raw grayscale source. A 2-color
+  // mask is exactly the kind of discrete, sharp-edge pixel data this
+  // algorithm family is designed for, and running it after despeckle/hole
+  // fill means those passes never need factor-aware area thresholds. The
+  // upscaled mask (not the natural-resolution one) is what gets rasterized
+  // below and handed to ImageTracer, which is what gives ImageTracer extra
+  // coordinate resolution to fit smoother curves against (supersampled
+  // tracing) — cleanupSVG's viewBox/width/height split then scales the
+  // traced result back down to natural size for display/export.
+  let maskWidth = imgData.width;
+  let maskHeight = imgData.height;
+  const upscaleFactor = settings.upscaleFactor || 1;
+
+  if (upscaleFactor > 1) {
+    const upscaled = Upscale.upscaleMask(mask, maskWidth, maskHeight, upscaleFactor);
+    mask = upscaled.data;
+    maskWidth = upscaled.width;
+    maskHeight = upscaled.height;
+  }
+
+  const imageData = maskToImageData(mask, maskWidth, maskHeight);
   const previewUrl = makePreviewURL(imageData);
 
   return {
     imageData,
     resolvedThreshold,
     autoThreshold,
-    coverage: filledPixels / mask.length,
+    coverage,
     maskPreviewUrl: previewUrl,
     previewUrl,
+    maskWidth,
+    maskHeight,
+    upscaleFactor,
   };
 }
 
@@ -687,6 +721,9 @@ function collectTraceStats(tracedata, svgStr, processed) {
     holeCount,
     segmentCount,
     byteSize: new Blob([svgStr]).size,
+    upscaleFactor: processed.upscaleFactor,
+    maskWidth: processed.maskWidth,
+    maskHeight: processed.maskHeight,
   };
 }
 
@@ -789,21 +826,28 @@ function renderSVGTab(svgStr, stats, maskPreviewUrl) {
   const holeCount = stats?.holeCount ?? 0;
   const thresholdText = stats ? stats.resolvedThreshold + ' (auto ' + stats.autoThreshold + ')' : 'n/a';
   const coverageText = stats ? Math.round(stats.coverage * 100) + '%' : 'n/a';
+  const upscaleChip = (stats && stats.upscaleFactor > 1)
+    ? '<div class="meta-chip">Supersample: <b>' + stats.upscaleFactor + '× (' + stats.maskWidth + '×' + stats.maskHeight + ')</b></div>'
+    : '';
 
   document.getElementById('svg-meta').innerHTML =
     '<div class="meta-chip">Paths: <b>' + pathCount + '</b></div>' +
     '<div class="meta-chip">Holes: <b>' + holeCount + '</b></div>' +
     '<div class="meta-chip">Threshold: <b>' + thresholdText + '</b></div>' +
     '<div class="meta-chip">Coverage: <b>' + coverageText + '</b></div>' +
-    '<div class="meta-chip">Size: <b>' + (byteSize / 1024).toFixed(1) + ' KB</b></div>';
+    '<div class="meta-chip">Size: <b>' + (byteSize / 1024).toFixed(1) + ' KB</b></div>' +
+    upscaleChip;
 
   const svgDark = recolor(svgStr, '#000000');
   const svgLight = recolor(svgStr, '#ffffff');
   const svgColor = recolor(svgStr, selectedColor);
 
+  const maskLabel = (stats && stats.upscaleFactor > 1)
+    ? 'Processed mask (upscaled ' + stats.upscaleFactor + '×, as traced)'
+    : 'Processed mask';
   const maskCard = maskPreviewUrl
     ? '<div class="prev-card">' +
-        '<div class="prev-card-lbl">Processed mask</div>' +
+        '<div class="prev-card-lbl">' + maskLabel + '</div>' +
         '<div class="prev-card-body mask-preview"><img src="' + maskPreviewUrl + '" alt="Processed binary mask preview"></div>' +
       '</div>'
     : '';
