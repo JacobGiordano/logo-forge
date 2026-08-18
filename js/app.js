@@ -1,6 +1,15 @@
 // ── State ──────────────────────────────────────────────────────────────────
 let srcImage = null;
 let pendingImage = null; // full uploaded image, awaiting selection confirmation
+// Persistent "what to reopen" state — distinct from pendingImage/selectionBox,
+// which are transient and only live while the selection view is actively open.
+// Populated right before finalizeImage() on a confirmed selection; reset
+// whenever a genuinely new file comes in via handleFile (a fresh upload is
+// not "editing" the previous crop). Stays null for images that skipped the
+// selection view entirely (see SELECT_SKIP_MAX_DIM) — there was no selection
+// to re-edit.
+let lastUploadedSheet = null; // the original uploaded Image that was cropped
+let lastCropRect = null; // {sx,sy,sw,sh} in true source-image pixels
 let currentSVG = null;
 let currentMaskPreview = null;
 let currentTraceStats = null;
@@ -237,6 +246,10 @@ const SELECT_SKIP_MAX_DIM = 256;
 
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
+  // A fresh upload is not "editing" the previous crop — discard whatever
+  // selection state was remembered for the prior image.
+  lastUploadedSheet = null;
+  lastCropRect = null;
   const reader = new FileReader();
   reader.onload = e => {
     const img = new Image();
@@ -266,9 +279,19 @@ function finalizeImage(img, dataUrl) {
   document.getElementById('thumb-wrap').style.display = 'block';
   document.getElementById('thumb-img').src = dataUrl;
   document.getElementById('trace-btn').disabled = false;
+  updateEditCropButton();
   setStatus('Loaded ' + img.width + '×' + img.height + 'px — ready to trace');
   autoDetect(img);
   scheduleLive();
+}
+
+// Shows "edit crop" only when there's an original sheet + prior crop to
+// re-edit — i.e. this image actually went through the selection view.
+// Images that skipped it (SELECT_SKIP_MAX_DIM) never set lastUploadedSheet,
+// so the button stays hidden rather than reopening a broken/empty view.
+const editCropBtn = document.getElementById('edit-crop-btn');
+function updateEditCropButton() {
+  editCropBtn.style.display = lastUploadedSheet ? '' : 'none';
 }
 
 function autoDetect(img) {
@@ -602,6 +625,12 @@ selectConfirmBtn.addEventListener('click', () => {
   const sx = clamp(Math.round((selectionBox.x - imagePanX) * scaleX), 0, pendingImage.width - sw);
   const sy = clamp(Math.round((selectionBox.y - imagePanY) * scaleY), 0, pendingImage.height - sh);
 
+  // Remember the original sheet and this crop rect (true source pixels) so
+  // "Edit crop" can reopen the selection view pre-filled later — separate
+  // from pendingImage, which finalizeImage() is about to null out.
+  lastUploadedSheet = pendingImage;
+  lastCropRect = { sx, sy, sw, sh };
+
   const cropCanvas = document.createElement('canvas');
   cropCanvas.width = sw;
   cropCanvas.height = sh;
@@ -611,6 +640,31 @@ selectConfirmBtn.addEventListener('click', () => {
   const cropped = new Image();
   cropped.onload = () => finalizeImage(cropped, dataUrl);
   cropped.src = dataUrl;
+});
+
+// Reopens the selection view on the original sheet, pre-filling the frame
+// with the previously confirmed crop rect (converted from source pixels
+// back to the fresh view's display pixels) so the user is adjusting their
+// prior selection rather than starting over. Uses the same openSelectionView
+// a fresh large upload goes through — no new interaction code, this just
+// pre-seeds state the existing drag/resize/pan/crosshair/center code already
+// knows how to work with.
+editCropBtn.addEventListener('click', () => {
+  if (!lastUploadedSheet) return;
+  openSelectionView(lastUploadedSheet);
+  if (lastCropRect) {
+    const scale = selectCanvas.width / lastUploadedSheet.width;
+    selectionBox = {
+      x: lastCropRect.sx * scale,
+      y: lastCropRect.sy * scale,
+      w: lastCropRect.sw * scale,
+      h: lastCropRect.sh * scale,
+    };
+    imagePanX = 0;
+    imagePanY = 0;
+    updateSelectRectEl();
+    selectConfirmBtn.disabled = false;
+  }
 });
 
 ['file-input', 'file-input2'].forEach(id => {

@@ -136,6 +136,7 @@ header h1 span{color:var(--accent);}
   position:absolute;inset:0;
   background:rgba(12,12,13,0);
   display:flex;align-items:flex-end;justify-content:flex-end;
+  gap:6px;
   padding:8px;
   transition:background 0.2s;
 }
