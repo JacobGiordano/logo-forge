@@ -36,6 +36,20 @@
           <input type="file" id="file-input2" accept="image/*">
         </div>
       </div>
+      <div id="select-wrap">
+        <p class="select-hint">Drag a rectangle around the icon you want to trace</p>
+        <div class="select-canvas-wrap">
+          <canvas id="select-canvas"></canvas>
+          <div id="select-rect"></div>
+        </div>
+        <div class="select-actions">
+          <button type="button" class="select-link-btn" id="select-change-btn">choose a different image ↑</button>
+          <div class="select-actions-main">
+            <button type="button" class="btn btn-secondary" id="select-clear-btn">Clear</button>
+            <button type="button" class="btn btn-primary" id="select-confirm-btn" disabled>Use selection</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="panel-section">

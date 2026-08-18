@@ -1,5 +1,6 @@
 // ── State ──────────────────────────────────────────────────────────────────
 let srcImage = null;
+let pendingImage = null; // full uploaded image, awaiting selection confirmation
 let currentSVG = null;
 let currentMaskPreview = null;
 let currentTraceStats = null;
@@ -227,24 +228,47 @@ document.getElementById('custom-color').addEventListener('input', e => {
 });
 
 // ── File handling ─────────────────────────────────────────────────────────
+// Images at or below this size (in either dimension) are already icon-sized
+// on their own — a marquee-select step would add friction with no benefit,
+// so they skip straight to the existing immediate-trace-ready flow. Larger
+// images (the multi-icon sheet case this issue targets) go through the
+// selection view instead.
+const SELECT_SKIP_MAX_DIM = 256;
+
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
   const reader = new FileReader();
   reader.onload = e => {
     const img = new Image();
     img.onload = () => {
-      srcImage = img;
-      document.getElementById('dropzone').style.display = 'none';
-      document.getElementById('thumb-wrap').style.display = 'block';
-      document.getElementById('thumb-img').src = e.target.result;
-      document.getElementById('trace-btn').disabled = false;
-      setStatus('Loaded ' + img.width + '×' + img.height + 'px — ready to trace');
-      autoDetect(img);
-      scheduleLive();
+      if (img.width <= SELECT_SKIP_MAX_DIM && img.height <= SELECT_SKIP_MAX_DIM) {
+        finalizeImage(img, e.target.result);
+      } else {
+        openSelectionView(img);
+      }
     };
     img.src = e.target.result;
   };
   reader.readAsDataURL(file);
+}
+
+// Same tail the pre-selection flow always ran on upload: set srcImage, swap
+// the source-panel view to the thumbnail, enable tracing, auto-detect
+// polarity, and kick off a live trace if enabled. Used both for the
+// skip-selection path and after a marquee selection is confirmed and
+// cropped — autoDetect runs on whichever image ends up here, so a cropped
+// selection is characterized on its own pixels, not the full sheet's.
+function finalizeImage(img, dataUrl) {
+  srcImage = img;
+  pendingImage = null;
+  document.getElementById('dropzone').style.display = 'none';
+  document.getElementById('select-wrap').style.display = 'none';
+  document.getElementById('thumb-wrap').style.display = 'block';
+  document.getElementById('thumb-img').src = dataUrl;
+  document.getElementById('trace-btn').disabled = false;
+  setStatus('Loaded ' + img.width + '×' + img.height + 'px — ready to trace');
+  autoDetect(img);
+  scheduleLive();
 }
 
 function autoDetect(img) {
@@ -261,6 +285,125 @@ function autoDetect(img) {
   }
   detectedInvert = (sum / (d.length / 4)) < 128;
 }
+
+// ── Marquee selection view ───────────────────────────────────────────────
+// Fits the whole uploaded image into the left panel's width so the entire
+// sheet is visible at once — no zoom/pan (that's issue #7). The user
+// click-drags a free-form rectangle over the icon they want; coordinates
+// are tracked in on-screen canvas pixels, then scaled back up to true
+// source-image pixels at confirm time so the crop is always taken from
+// the full-resolution source, never from the downscaled display.
+const MAX_SELECT_DISPLAY_WIDTH = 260;
+const MIN_SELECT_PX = 6; // minimum on-screen drag size before a selection counts as non-trivial
+
+const selectCanvas = document.getElementById('select-canvas');
+const selectRectEl = document.getElementById('select-rect');
+const selectConfirmBtn = document.getElementById('select-confirm-btn');
+const selectClearBtn = document.getElementById('select-clear-btn');
+const selectChangeBtn = document.getElementById('select-change-btn');
+
+let selectionBox = null; // {x,y,w,h} in select-canvas display pixels
+let dragOrigin = null;
+
+function openSelectionView(img) {
+  pendingImage = img;
+  document.getElementById('dropzone').style.display = 'none';
+  document.getElementById('thumb-wrap').style.display = 'none';
+  document.getElementById('select-wrap').style.display = 'block';
+
+  const scale = Math.min(1, MAX_SELECT_DISPLAY_WIDTH / img.width);
+  selectCanvas.width = Math.max(1, Math.round(img.width * scale));
+  selectCanvas.height = Math.max(1, Math.round(img.height * scale));
+  selectCanvas.getContext('2d').drawImage(img, 0, 0, selectCanvas.width, selectCanvas.height);
+
+  clearSelectionBox();
+  setStatus('Drag to select a region, then confirm');
+}
+
+function clearSelectionBox() {
+  selectionBox = null;
+  dragOrigin = null;
+  selectRectEl.style.display = 'none';
+  selectConfirmBtn.disabled = true;
+}
+
+function updateSelectRectEl() {
+  if (!selectionBox) { selectRectEl.style.display = 'none'; return; }
+  selectRectEl.style.display = 'block';
+  selectRectEl.style.left = selectionBox.x + 'px';
+  selectRectEl.style.top = selectionBox.y + 'px';
+  selectRectEl.style.width = selectionBox.w + 'px';
+  selectRectEl.style.height = selectionBox.h + 'px';
+}
+
+function eventToCanvasPoint(e) {
+  const rect = selectCanvas.getBoundingClientRect();
+  const scaleX = selectCanvas.width / rect.width;
+  const scaleY = selectCanvas.height / rect.height;
+  return {
+    x: clamp((e.clientX - rect.left) * scaleX, 0, selectCanvas.width),
+    y: clamp((e.clientY - rect.top) * scaleY, 0, selectCanvas.height),
+  };
+}
+
+selectCanvas.addEventListener('mousedown', e => {
+  e.preventDefault();
+  dragOrigin = eventToCanvasPoint(e);
+  selectionBox = { x: dragOrigin.x, y: dragOrigin.y, w: 0, h: 0 };
+  updateSelectRectEl();
+  document.addEventListener('mousemove', onSelectDrag);
+  document.addEventListener('mouseup', onSelectDragEnd);
+});
+
+function onSelectDrag(e) {
+  if (!dragOrigin) return;
+  const p = eventToCanvasPoint(e);
+  selectionBox = {
+    x: Math.min(dragOrigin.x, p.x),
+    y: Math.min(dragOrigin.y, p.y),
+    w: Math.abs(p.x - dragOrigin.x),
+    h: Math.abs(p.y - dragOrigin.y),
+  };
+  updateSelectRectEl();
+}
+
+function onSelectDragEnd() {
+  dragOrigin = null;
+  document.removeEventListener('mousemove', onSelectDrag);
+  document.removeEventListener('mouseup', onSelectDragEnd);
+  const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
+  selectConfirmBtn.disabled = !valid;
+  if (!valid) { selectionBox = null; updateSelectRectEl(); }
+}
+
+selectClearBtn.addEventListener('click', clearSelectionBox);
+
+selectChangeBtn.addEventListener('click', () => {
+  document.getElementById('file-input2').click();
+});
+
+selectConfirmBtn.addEventListener('click', () => {
+  if (!pendingImage || !selectionBox) return;
+
+  // Map the on-screen selection back to true source-image pixels — never
+  // crop from the downscaled display canvas.
+  const scaleX = pendingImage.width / selectCanvas.width;
+  const scaleY = pendingImage.height / selectCanvas.height;
+  const sx = Math.round(selectionBox.x * scaleX);
+  const sy = Math.round(selectionBox.y * scaleY);
+  const sw = Math.max(1, Math.round(selectionBox.w * scaleX));
+  const sh = Math.max(1, Math.round(selectionBox.h * scaleY));
+
+  const cropCanvas = document.createElement('canvas');
+  cropCanvas.width = sw;
+  cropCanvas.height = sh;
+  cropCanvas.getContext('2d').drawImage(pendingImage, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  const dataUrl = cropCanvas.toDataURL('image/png');
+  const cropped = new Image();
+  cropped.onload = () => finalizeImage(cropped, dataUrl);
+  cropped.src = dataUrl;
+});
 
 ['file-input', 'file-input2'].forEach(id => {
   document.getElementById(id).addEventListener('change', e => handleFile(e.target.files[0]));
