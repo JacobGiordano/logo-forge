@@ -40,7 +40,18 @@
         <p class="select-hint">Drag a rectangle around the icon you want to trace</p>
         <div class="select-canvas-wrap">
           <canvas id="select-canvas"></canvas>
-          <div id="select-rect"></div>
+          <div id="select-rect">
+            <div class="select-crosshair-v"></div>
+            <div class="select-crosshair-h"></div>
+            <div class="select-handle nw"></div>
+            <div class="select-handle ne"></div>
+            <div class="select-handle sw"></div>
+            <div class="select-handle se"></div>
+          </div>
+        </div>
+        <div class="select-tools">
+          <button type="button" class="select-tool-btn" id="select-crosshair-btn" aria-pressed="false">+ Guides</button>
+          <button type="button" class="select-tool-btn" id="select-center-btn">⊙ Center</button>
         </div>
         <div class="select-actions">
           <button type="button" class="select-link-btn" id="select-change-btn">choose a different image ↑</button>

@@ -295,18 +295,29 @@ function autoDetect(img) {
 // the full-resolution source, never from the downscaled display.
 const MAX_SELECT_DISPLAY_WIDTH = 260;
 const MIN_SELECT_PX = 6; // minimum on-screen drag size before a selection counts as non-trivial
+const HANDLE_TOL = 8; // hit-test tolerance (canvas display px) around each corner handle
 
 const selectCanvas = document.getElementById('select-canvas');
 const selectRectEl = document.getElementById('select-rect');
 const selectConfirmBtn = document.getElementById('select-confirm-btn');
 const selectClearBtn = document.getElementById('select-clear-btn');
 const selectChangeBtn = document.getElementById('select-change-btn');
+const selectCrosshairBtn = document.getElementById('select-crosshair-btn');
+const selectCenterBtn = document.getElementById('select-center-btn');
 
-let selectionBox = null; // {x,y,w,h} in select-canvas display pixels
-let dragOrigin = null;
+let selectionBox = null; // {x,y,w,h} in select-canvas display pixels — the frame; stays fixed while panning
+let dragOrigin = null; // origin point for a brand-new box drag
+let dragMode = null; // 'new' | 'resize' | 'pan'
+let resizeAnchor = null; // {x,y} — the corner opposite the one being dragged, stays fixed during a resize
+let panDragStart = null; // {x,y,panX,panY} — mouse start + pan offset at start of a pan drag
+let imagePanX = 0; // image draw offset (canvas display px) — the frame is fixed, this pans content under it
+let imagePanY = 0;
+let showCrosshair = false;
 
 function openSelectionView(img) {
   pendingImage = img;
+  imagePanX = 0;
+  imagePanY = 0;
   document.getElementById('dropzone').style.display = 'none';
   document.getElementById('thumb-wrap').style.display = 'none';
   document.getElementById('select-wrap').style.display = 'block';
@@ -314,15 +325,43 @@ function openSelectionView(img) {
   const scale = Math.min(1, MAX_SELECT_DISPLAY_WIDTH / img.width);
   selectCanvas.width = Math.max(1, Math.round(img.width * scale));
   selectCanvas.height = Math.max(1, Math.round(img.height * scale));
-  selectCanvas.getContext('2d').drawImage(img, 0, 0, selectCanvas.width, selectCanvas.height);
+  redrawSelectCanvasBackground();
 
   clearSelectionBox();
   setStatus('Drag to select a region, then confirm');
 }
 
+// Redraws the sheet image onto select-canvas at the current pan offset.
+// The frame (selectionBox) is a separate absolutely-positioned overlay and
+// never moves when this runs — only the pixels underneath it do.
+function redrawSelectCanvasBackground() {
+  if (!pendingImage) return;
+  const ctx = selectCanvas.getContext('2d');
+  ctx.clearRect(0, 0, selectCanvas.width, selectCanvas.height);
+  ctx.drawImage(
+    pendingImage, 0, 0, pendingImage.width, pendingImage.height,
+    imagePanX, imagePanY, selectCanvas.width, selectCanvas.height
+  );
+}
+
+// Clamps imagePanX/Y so the frame region is always fully covered by image
+// content — panning stops once the image edge would reach the frame edge.
+// (Simpler than drawing the image with extra margin, and matches user
+// expectation: you can't pan past the point where you'd be cropping
+// outside the actual image.)
+function clampPan(box) {
+  if (!box) { imagePanX = 0; imagePanY = 0; return; }
+  imagePanX = clamp(imagePanX, box.x + box.w - selectCanvas.width, box.x);
+  imagePanY = clamp(imagePanY, box.y + box.h - selectCanvas.height, box.y);
+}
+
 function clearSelectionBox() {
   selectionBox = null;
   dragOrigin = null;
+  dragMode = null;
+  imagePanX = 0;
+  imagePanY = 0;
+  redrawSelectCanvasBackground();
   selectRectEl.style.display = 'none';
   selectConfirmBtn.disabled = true;
 }
@@ -334,6 +373,7 @@ function updateSelectRectEl() {
   selectRectEl.style.top = selectionBox.y + 'px';
   selectRectEl.style.width = selectionBox.w + 'px';
   selectRectEl.style.height = selectionBox.h + 'px';
+  selectRectEl.classList.toggle('show-crosshair', showCrosshair);
 }
 
 function eventToCanvasPoint(e) {
@@ -346,34 +386,131 @@ function eventToCanvasPoint(e) {
   };
 }
 
+// Which corner handle (if any) a canvas point is within tolerance of.
+function hitTestHandle(p) {
+  if (!selectionBox) return null;
+  const corners = {
+    nw: { x: selectionBox.x, y: selectionBox.y },
+    ne: { x: selectionBox.x + selectionBox.w, y: selectionBox.y },
+    sw: { x: selectionBox.x, y: selectionBox.y + selectionBox.h },
+    se: { x: selectionBox.x + selectionBox.w, y: selectionBox.y + selectionBox.h },
+  };
+  for (const name of Object.keys(corners)) {
+    const c = corners[name];
+    if (Math.abs(p.x - c.x) <= HANDLE_TOL && Math.abs(p.y - c.y) <= HANDLE_TOL) return name;
+  }
+  return null;
+}
+
+function pointInBox(p) {
+  return !!selectionBox &&
+    p.x >= selectionBox.x && p.x <= selectionBox.x + selectionBox.w &&
+    p.y >= selectionBox.y && p.y <= selectionBox.y + selectionBox.h;
+}
+
+// Hover feedback only (not part of any drag) — signals which of the three
+// interactions (resize / pan / new-box) a mousedown here would start.
+selectCanvas.addEventListener('mousemove', e => {
+  if (dragMode) return;
+  const p = eventToCanvasPoint(e);
+  const handle = hitTestHandle(p);
+  if (handle) {
+    selectCanvas.style.cursor = (handle === 'nw' || handle === 'se') ? 'nwse-resize' : 'nesw-resize';
+  } else if (pointInBox(p)) {
+    selectCanvas.style.cursor = 'move';
+  } else {
+    selectCanvas.style.cursor = 'crosshair';
+  }
+});
+
 selectCanvas.addEventListener('mousedown', e => {
   e.preventDefault();
-  dragOrigin = eventToCanvasPoint(e);
-  selectionBox = { x: dragOrigin.x, y: dragOrigin.y, w: 0, h: 0 };
+  const p = eventToCanvasPoint(e);
+  const handle = hitTestHandle(p);
+
+  if (handle) {
+    dragMode = 'resize';
+    const opposite = {
+      nw: { x: selectionBox.x + selectionBox.w, y: selectionBox.y + selectionBox.h },
+      ne: { x: selectionBox.x, y: selectionBox.y + selectionBox.h },
+      sw: { x: selectionBox.x + selectionBox.w, y: selectionBox.y },
+      se: { x: selectionBox.x, y: selectionBox.y },
+    }[handle];
+    resizeAnchor = opposite;
+  } else if (pointInBox(p)) {
+    dragMode = 'pan';
+    panDragStart = { x: p.x, y: p.y, panX: imagePanX, panY: imagePanY };
+  } else {
+    dragMode = 'new';
+    dragOrigin = p;
+    imagePanX = 0;
+    imagePanY = 0;
+    redrawSelectCanvasBackground();
+    selectionBox = { x: p.x, y: p.y, w: 0, h: 0 };
+  }
   updateSelectRectEl();
   document.addEventListener('mousemove', onSelectDrag);
   document.addEventListener('mouseup', onSelectDragEnd);
 });
 
 function onSelectDrag(e) {
-  if (!dragOrigin) return;
   const p = eventToCanvasPoint(e);
-  selectionBox = {
-    x: Math.min(dragOrigin.x, p.x),
-    y: Math.min(dragOrigin.y, p.y),
-    w: Math.abs(p.x - dragOrigin.x),
-    h: Math.abs(p.y - dragOrigin.y),
-  };
+
+  if (dragMode === 'new') {
+    if (!dragOrigin) return;
+    selectionBox = {
+      x: Math.min(dragOrigin.x, p.x),
+      y: Math.min(dragOrigin.y, p.y),
+      w: Math.abs(p.x - dragOrigin.x),
+      h: Math.abs(p.y - dragOrigin.y),
+    };
+  } else if (dragMode === 'resize') {
+    if (!resizeAnchor) return;
+    // Never shrink below MIN_SELECT_PX while dragging — keeps the box
+    // anchored to the fixed opposite corner instead of needing a
+    // post-drag correction.
+    const nw = Math.max(Math.abs(p.x - resizeAnchor.x), MIN_SELECT_PX);
+    const nh = Math.max(Math.abs(p.y - resizeAnchor.y), MIN_SELECT_PX);
+    const dirX = p.x >= resizeAnchor.x ? 1 : -1;
+    const dirY = p.y >= resizeAnchor.y ? 1 : -1;
+    let nx = dirX === 1 ? resizeAnchor.x : resizeAnchor.x - nw;
+    let ny = dirY === 1 ? resizeAnchor.y : resizeAnchor.y - nh;
+    nx = clamp(nx, 0, selectCanvas.width - nw);
+    ny = clamp(ny, 0, selectCanvas.height - nh);
+    selectionBox = { x: nx, y: ny, w: nw, h: nh };
+    clampPan(selectionBox);
+    redrawSelectCanvasBackground();
+  } else if (dragMode === 'pan') {
+    if (!panDragStart) return;
+    imagePanX = panDragStart.panX + (p.x - panDragStart.x);
+    imagePanY = panDragStart.panY + (p.y - panDragStart.y);
+    clampPan(selectionBox);
+    redrawSelectCanvasBackground();
+  }
   updateSelectRectEl();
 }
 
 function onSelectDragEnd() {
-  dragOrigin = null;
   document.removeEventListener('mousemove', onSelectDrag);
   document.removeEventListener('mouseup', onSelectDragEnd);
-  const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
-  selectConfirmBtn.disabled = !valid;
-  if (!valid) { selectionBox = null; updateSelectRectEl(); }
+
+  if (dragMode === 'new') {
+    const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
+    if (!valid) {
+      selectionBox = null;
+    } else {
+      clampPan(selectionBox);
+    }
+    selectConfirmBtn.disabled = !valid;
+    updateSelectRectEl();
+  }
+  // 'resize' and 'pan' drags only ever run against an already-valid
+  // selectionBox, so confirm stays enabled and no correction is needed.
+
+  dragOrigin = null;
+  dragMode = null;
+  resizeAnchor = null;
+  panDragStart = null;
 }
 
 selectClearBtn.addEventListener('click', clearSelectionBox);
@@ -382,17 +519,88 @@ selectChangeBtn.addEventListener('click', () => {
   document.getElementById('file-input2').click();
 });
 
+selectCrosshairBtn.addEventListener('click', () => {
+  showCrosshair = !showCrosshair;
+  selectCrosshairBtn.classList.toggle('active', showCrosshair);
+  selectCrosshairBtn.setAttribute('aria-pressed', String(showCrosshair));
+  updateSelectRectEl();
+});
+
+// One-shot re-center: finds the subject's bounding box within the currently
+// visible frame region (reusing the same Otsu-threshold + mask primitives
+// the main trace pipeline uses) and pans the image so that box is centered
+// under the frame. Not an ongoing snap — runs once per click.
+selectCenterBtn.addEventListener('click', () => {
+  if (!pendingImage || !selectionBox) return;
+  centerSubjectInFrame();
+});
+
+function centerSubjectInFrame() {
+  const ctx = selectCanvas.getContext('2d');
+  const fx = Math.round(selectionBox.x);
+  const fy = Math.round(selectionBox.y);
+  const fw = Math.max(1, Math.round(selectionBox.w));
+  const fh = Math.max(1, Math.round(selectionBox.h));
+  const frameData = ctx.getImageData(fx, fy, fw, fh);
+
+  const luminance = new Uint8Array(fw * fh);
+  const hist = new Uint32Array(256);
+  let sum = 0;
+  for (let i = 0, px = 0; i < frameData.data.length; i += 4, px++) {
+    const alpha = frameData.data[i + 3] / 255;
+    const lum = (frameData.data[i] * 0.299 + frameData.data[i + 1] * 0.587 + frameData.data[i + 2] * 0.114) * alpha + 255 * (1 - alpha);
+    const rounded = Math.max(0, Math.min(255, Math.round(lum)));
+    luminance[px] = rounded;
+    hist[rounded]++;
+    sum += rounded;
+  }
+
+  // Same auto-polarity heuristic as autoDetect(): a mostly-dark visible
+  // region means the background is dark and the subject is the lighter
+  // pixels, and vice versa.
+  const threshold = computeOtsuThreshold(hist, luminance.length);
+  const invert = (sum / luminance.length) < 128;
+  const mask = buildMask(luminance, fw, fh, threshold, invert);
+
+  let minX = fw;
+  let minY = fh;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < fh; y++) {
+    for (let x = 0; x < fw; x++) {
+      if (mask[y * fw + x]) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return; // no distinguishable subject — leave framing as-is
+
+  const subjectCx = (minX + maxX + 1) / 2;
+  const subjectCy = (minY + maxY + 1) / 2;
+  imagePanX += fw / 2 - subjectCx;
+  imagePanY += fh / 2 - subjectCy;
+  clampPan(selectionBox);
+  redrawSelectCanvasBackground();
+  updateSelectRectEl();
+}
+
 selectConfirmBtn.addEventListener('click', () => {
   if (!pendingImage || !selectionBox) return;
 
-  // Map the on-screen selection back to true source-image pixels — never
-  // crop from the downscaled display canvas.
+  // Map the on-screen selection back to true source-image pixels, taking
+  // the current pan offset into account — never crop from the downscaled
+  // display canvas, and always crop from wherever the image content
+  // actually sits under the fixed frame right now.
   const scaleX = pendingImage.width / selectCanvas.width;
   const scaleY = pendingImage.height / selectCanvas.height;
-  const sx = Math.round(selectionBox.x * scaleX);
-  const sy = Math.round(selectionBox.y * scaleY);
   const sw = Math.max(1, Math.round(selectionBox.w * scaleX));
   const sh = Math.max(1, Math.round(selectionBox.h * scaleY));
+  const sx = clamp(Math.round((selectionBox.x - imagePanX) * scaleX), 0, pendingImage.width - sw);
+  const sy = clamp(Math.round((selectionBox.y - imagePanY) * scaleY), 0, pendingImage.height - sh);
 
   const cropCanvas = document.createElement('canvas');
   cropCanvas.width = sw;

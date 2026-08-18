@@ -179,9 +179,61 @@ header h1 span{color:var(--accent);}
 #select-rect{
   position:absolute;
   display:none;
-  border:1.5px dashed var(--accent);
-  background:rgba(184,255,87,0.15);
+  border:1.5px solid rgba(255,255,255,0.95);
+  /* Inner ring for edge definition against any content, outer huge-spread
+     ring acts as a dark scrim over everything outside the box (clipped by
+     .select-canvas-wrap's overflow:hidden) — reads clearly regardless of
+     source image brightness, unlike a single outline color ever could. */
+  box-shadow:
+    0 0 0 1.5px rgba(0,0,0,0.9),
+    0 0 0 9999px rgba(8,8,10,0.6);
   pointer-events:none;
+}
+.select-handle{
+  position:absolute;
+  width:9px;height:9px;
+  background:#fff;
+  border:1.5px solid #0c0c0d;
+  border-radius:2px;
+  box-shadow:0 0 0 1px rgba(0,0,0,0.45);
+  pointer-events:none;
+}
+.select-handle.nw{top:-5px;left:-5px;}
+.select-handle.ne{top:-5px;right:-5px;}
+.select-handle.sw{bottom:-5px;left:-5px;}
+.select-handle.se{bottom:-5px;right:-5px;}
+.select-crosshair-v,.select-crosshair-h{
+  position:absolute;
+  background:rgba(255,255,255,0.9);
+  box-shadow:0 0 0 1px rgba(0,0,0,0.6);
+  pointer-events:none;
+  display:none;
+}
+.select-crosshair-v{top:0;bottom:0;left:50%;width:1px;}
+.select-crosshair-h{left:0;right:0;top:50%;height:1px;}
+#select-rect.show-crosshair .select-crosshair-v,
+#select-rect.show-crosshair .select-crosshair-h{display:block;}
+.select-tools{
+  display:flex;
+  gap:8px;
+  margin-top:10px;
+}
+.select-tool-btn{
+  font-family:'DM Mono',monospace;
+  font-size:10px;
+  padding:5px 10px;
+  background:var(--s2);
+  border:1px solid var(--border);
+  color:var(--muted);
+  border-radius:5px;
+  cursor:pointer;
+  transition:all 0.15s;
+}
+.select-tool-btn:hover{border-color:var(--border2);color:var(--text);}
+.select-tool-btn.active{
+  border-color:var(--accent);
+  color:var(--accent);
+  background:rgba(184,255,87,0.07);
 }
 .select-actions{
   margin-top:10px;
