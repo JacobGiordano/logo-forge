@@ -2,27 +2,27 @@ Last updated: 2026-08-19
 
 ## Status
 
-Issue #9 (re-edit a confirmed crop via new "Edit crop" button) complete and merged to main.
+Issues #6 (auto-trim negative space) and #7 (zoom/pan selection canvas) complete and merged to main, shipped together.
 
 ## Decisions made this session
 
-- New persistent state `lastUploadedSheet`/`lastCropRect`, kept separate from the transient `pendingImage`/`selectionBox` used while the selection view is actively open — avoids conflating "mid-selection" state with "what to reopen later"
-- "Edit crop" reuses `openSelectionView` and pre-seeds `selectionBox`/pan from `lastCropRect` rather than adding any new drag/resize/pan code — #8's existing tools handle the rest unchanged
-- Button is hidden for images that took the skip-selection bypass (≤256px, no `lastUploadedSheet` to edit) rather than showing a broken empty selection view
-- Rune review skipped by user decision again — no new external/network input surface, same risk profile as #5/#8
+- #7: screen→source coordinate mapping consolidated into `selectionRectToSourceRect()` in `js/app.js` — the single integration point any future selection-consuming feature should use, regardless of zoom/pan state at confirm time
+- #7: pan is hold-Space+drag or middle-click-drag, not plain left-drag — left-drag was already "draw a marquee," so overloading it would make selection impossible while zoomed in
+- #7: "Edit crop" (#9) reopens at fit-to-view rather than restoring the zoom/pan active at confirm time — the crop rect itself is unaffected, so preserving zoom history wasn't worth the complexity
+- #6: auto-trim reuses #8's existing luminance+Otsu bbox detection (`centerSubjectInFrame`'s approach), not the full trace pipeline (`preprocessImageData`) — trim results must not silently depend on whatever the Trace panel sliders currently say
+- #6: defaults ON — the feature's whole point is "selections don't need to be pixel-perfect," so off-by-default would only benefit users who find the toggle first
+- #6: re-applies (not re-stacks) when re-editing a crop via #9 — verified idempotent, not progressively shrinking, across repeated re-edits
+- Found and fixed a pre-existing bug while keyboard-testing #6's toggle: hold-Space-to-pan was swallowing Space on any focused button in the selection view (Guides, Center, zoom, etc.), contradicting its own comment's intent — one-line fix, re-verified no pan regression
+- Rune review skipped again by user decision — no new external/network input surface, same risk profile as #5/#7/#8/#9
 
 ## Next issues
 
-- #6 auto-trim negative space around the subject (depends on #5)
-- #7 zoom/pan the selection canvas for dense sheets (depends on #5)
-- Known gap, growing: still no Playwright coverage of the selection UI (resize handles, pan-drag, crosshair toggle, center-snap from #8; reopen/pre-fill from #9) — the only fixture (32×32) always takes the skip-selection bypass. Scout should add a larger, off-center fixture and selection-flow tests before this surface grows further.
+- No open issues queued right now — `gh issue list` is empty as of this ship
+- Known gap, still growing: no Playwright coverage of the selection UI at all (resize/pan/crosshair/center from #8, reopen/pre-fill from #9, zoom/pan from #7, auto-trim toggle from #6) — the only fixture (32×32) always takes the skip-selection bypass. Scout needs a larger, off-center fixture before this surface grows further; both #6 and #7 sessions left specific coverage notes in their PR reports for whoever picks this up.
 
 ## Gotchas
 
 - Plain static HTML/JS app — no build step, no framework
-- `serve` package used as dev server for Playwright tests only
-- Undo button stays disabled until a second trace is committed (by design)
-- Scale2x/3x-family upscaling bevels true 90° corners by ~1px (inherent to the algorithm) — negligible on curved logo art, visible on hard-cornered geometric fixtures
 - Selection view threshold (256px) is a plain constant in `js/app.js` — no UI to configure it
-- Image pan during crop-edit is clamped at the point the frame would no longer be fully covered by image content — there is deliberately no way to pan "off the edge"
-- A fresh upload (new file, or "replace ↑") always clears `lastUploadedSheet`/`lastCropRect` — "Edit crop" only ever reopens the most recent confirmed crop, not a history of them
+- Auto-trim margin (2px) is a plain constant (`AUTO_TRIM_MARGIN_PX`) in `js/app.js`
+- A fresh upload always clears `lastUploadedSheet`/`lastCropRect` — "Edit crop" only ever reopens the most recent confirmed crop
