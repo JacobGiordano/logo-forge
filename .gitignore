@@ -1,6 +1,7 @@
 node_modules/
 test-results/
 playwright-report/
+_screenshots
 
 # macOS
 .DS_Store
@@ -20,3 +21,4 @@ Icon
 Network Trash Folder
 Temporary Items
 .apdisk
+.claude/settings.local.json

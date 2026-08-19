@@ -1,0 +1,55 @@
+{
+  "name": "logo-forge Dev Container",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "TZ": "${localEnv:TZ:America/Los_Angeles}",
+      "CLAUDE_CODE_VERSION": "latest",
+      "GIT_DELTA_VERSION": "0.18.2",
+      "ZSH_IN_DOCKER_VERSION": "1.2.0"
+    }
+  },
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "eamodio.gitlens",
+        "dbaeumer.vscode-eslint",
+        "man-vu.claude-code-usage-dashboard",
+        "simonsiefke.svg-preview"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "zsh": { "path": "zsh" },
+          "bash": { "path": "bash", "icon": "terminal-bash" }
+        },
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "remoteUser": "node",
+  "containerUser": "node",
+  "mounts": [
+    "source=logo-forge-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=logo-forge-claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=logo-forge-gh-config-${devcontainerId},target=/home/node/.config/gh,type=volume"
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/node/.claude",
+    "DISABLE_AUTOUPDATER": "1",
+    "POWERLEVEL9K_DISABLE_GITSTATUS": "true",
+    "GH_TOKEN": "${localEnv:GH_TOKEN}",
+    "SLACK_WEBHOOK_URL": "${localEnv:SLACK_WEBHOOK_URL}",
+    "NODE_OPTIONS": "--max-old-space-size=4096"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "bash /workspace/.devcontainer/setup.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh",
+  "waitFor": "postStartCommand"
+}
