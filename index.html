@@ -38,9 +38,9 @@
         </div>
       </div>
       <div id="select-wrap">
-        <p class="select-hint">Drag a rectangle around the icon you want to trace</p>
+        <p class="select-hint">Scroll to zoom, hold space (or middle-drag) to pan, then drag a rectangle around the icon you want to trace</p>
         <div class="select-canvas-wrap">
-          <canvas id="select-canvas"></canvas>
+          <canvas id="select-canvas" tabindex="0" aria-label="Selection canvas — scroll or use the zoom buttons to zoom, hold space and drag (or arrow keys) to pan, drag to draw a selection rectangle"></canvas>
           <div id="select-rect">
             <div class="select-crosshair-v"></div>
             <div class="select-crosshair-h"></div>
@@ -53,6 +53,11 @@
         <div class="select-tools">
           <button type="button" class="select-tool-btn" id="select-crosshair-btn" aria-pressed="false">+ Guides</button>
           <button type="button" class="select-tool-btn" id="select-center-btn">⊙ Center</button>
+          <span class="select-tools-sep" aria-hidden="true"></span>
+          <button type="button" class="select-tool-btn select-zoom-btn" id="select-zoom-out-btn" aria-label="Zoom out">−</button>
+          <span class="select-zoom-readout" id="select-zoom-readout" aria-live="polite">100%</span>
+          <button type="button" class="select-tool-btn select-zoom-btn" id="select-zoom-in-btn" aria-label="Zoom in">+</button>
+          <button type="button" class="select-tool-btn" id="select-zoom-fit-btn">Fit</button>
         </div>
         <div class="select-actions">
           <button type="button" class="select-link-btn" id="select-change-btn">choose a different image ↑</button>

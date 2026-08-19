@@ -310,12 +310,14 @@ function autoDetect(img) {
 }
 
 // ── Marquee selection view ───────────────────────────────────────────────
-// Fits the whole uploaded image into the left panel's width so the entire
-// sheet is visible at once — no zoom/pan (that's issue #7). The user
-// click-drags a free-form rectangle over the icon they want; coordinates
-// are tracked in on-screen canvas pixels, then scaled back up to true
-// source-image pixels at confirm time so the crop is always taken from
-// the full-resolution source, never from the downscaled display.
+// Fits the whole uploaded image into the left panel's width on open (fit-
+// to-view default, viewZoom 1 — see the Zoom block below for #7's scroll/
+// button zoom and space-drag pan on top of that). The user click-drags a
+// free-form rectangle over the icon they want; coordinates are tracked in
+// on-screen canvas pixels, then mapped back to true source-image pixels
+// at confirm time (selectionRectToSourceRect, correct at any zoom/pan
+// state) so the crop is always taken from the full-resolution source,
+// never from the downscaled/zoomed display.
 const MAX_SELECT_DISPLAY_WIDTH = 260;
 const MIN_SELECT_PX = 6; // minimum on-screen drag size before a selection counts as non-trivial
 const HANDLE_TOL = 8; // hit-test tolerance (canvas display px) around each corner handle
@@ -327,63 +329,220 @@ const selectClearBtn = document.getElementById('select-clear-btn');
 const selectChangeBtn = document.getElementById('select-change-btn');
 const selectCrosshairBtn = document.getElementById('select-crosshair-btn');
 const selectCenterBtn = document.getElementById('select-center-btn');
+const selectZoomOutBtn = document.getElementById('select-zoom-out-btn');
+const selectZoomInBtn = document.getElementById('select-zoom-in-btn');
+const selectZoomFitBtn = document.getElementById('select-zoom-fit-btn');
+const selectZoomReadout = document.getElementById('select-zoom-readout');
 
 let selectionBox = null; // {x,y,w,h} in select-canvas display pixels — the frame; stays fixed while panning
 let dragOrigin = null; // origin point for a brand-new box drag
-let dragMode = null; // 'new' | 'resize' | 'pan'
+let dragMode = null; // 'new' | 'resize' | 'pan' | 'view-pan'
 let resizeAnchor = null; // {x,y} — the corner opposite the one being dragged, stays fixed during a resize
-let panDragStart = null; // {x,y,panX,panY} — mouse start + pan offset at start of a pan drag
-let imagePanX = 0; // image draw offset (canvas display px) — the frame is fixed, this pans content under it
+let panDragStart = null; // {x,y,panX,panY} — mouse start + pan offset at start of a box-relative pan drag (#8)
+let viewPanDragStart = null; // {x,y,panX,panY,sourceBoxRect} — same, for a whole-view pan drag (#7)
+let imagePanX = 0; // image draw offset (canvas display px) at the current zoom
 let imagePanY = 0;
 let showCrosshair = false;
+
+// Zoom (#7) — viewZoom is a multiplier on top of selectBaseScale (the
+// fit-to-view scale computed once per openSelectionView call). 1 = fit to
+// view, matching today's behavior for a single image. selectionBox stays
+// expressed in canvas-display px (unchanged from #8) — whenever the view
+// transform itself changes (zoom, or a whole-view pan), the box is
+// reprojected through the old→new transform so it stays visually attached
+// to the same source content instead of drifting. See
+// displayRectToSourceRect/sourceRectToDisplayRect below.
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 16;
+const ZOOM_WHEEL_STEP = 1.2;
+const ZOOM_BUTTON_STEP = 1.5;
+const PAN_KEY_STEP = 40; // canvas display px per arrow-key press
+let selectBaseScale = 1; // source px → canvas display px at viewZoom 1
+let viewZoom = 1;
+let spacePanning = false; // true while space is held — drag-anywhere pans the view
 
 function openSelectionView(img) {
   pendingImage = img;
   imagePanX = 0;
   imagePanY = 0;
+  viewZoom = 1;
+  spacePanning = false;
+  dragMode = null;
+  viewPanDragStart = null;
   document.getElementById('dropzone').style.display = 'none';
   document.getElementById('thumb-wrap').style.display = 'none';
   document.getElementById('select-wrap').style.display = 'block';
 
-  const scale = Math.min(1, MAX_SELECT_DISPLAY_WIDTH / img.width);
-  selectCanvas.width = Math.max(1, Math.round(img.width * scale));
-  selectCanvas.height = Math.max(1, Math.round(img.height * scale));
+  selectBaseScale = Math.min(1, MAX_SELECT_DISPLAY_WIDTH / img.width);
+  selectCanvas.width = Math.max(1, Math.round(img.width * selectBaseScale));
+  selectCanvas.height = Math.max(1, Math.round(img.height * selectBaseScale));
   redrawSelectCanvasBackground();
 
   clearSelectionBox();
-  setStatus('Drag to select a region, then confirm');
+  updateZoomReadout();
+  setStatus('Drag to select a region, then confirm — scroll to zoom');
 }
 
-// Redraws the sheet image onto select-canvas at the current pan offset.
-// The frame (selectionBox) is a separate absolutely-positioned overlay and
+// Redraws the sheet image onto select-canvas at the current pan/zoom. The
+// frame (selectionBox) is a separate absolutely-positioned overlay and
 // never moves when this runs — only the pixels underneath it do.
 function redrawSelectCanvasBackground() {
   if (!pendingImage) return;
   const ctx = selectCanvas.getContext('2d');
   ctx.clearRect(0, 0, selectCanvas.width, selectCanvas.height);
+  const scale = selectBaseScale * viewZoom;
   ctx.drawImage(
     pendingImage, 0, 0, pendingImage.width, pendingImage.height,
-    imagePanX, imagePanY, selectCanvas.width, selectCanvas.height
+    imagePanX, imagePanY, pendingImage.width * scale, pendingImage.height * scale
   );
 }
 
-// Clamps imagePanX/Y so the frame region is always fully covered by image
-// content — panning stops once the image edge would reach the frame edge.
-// (Simpler than drawing the image with extra margin, and matches user
-// expectation: you can't pan past the point where you'd be cropping
-// outside the actual image.)
-function clampPan(box) {
-  if (!box) { imagePanX = 0; imagePanY = 0; return; }
-  imagePanX = clamp(imagePanX, box.x + box.w - selectCanvas.width, box.x);
-  imagePanY = clamp(imagePanY, box.y + box.h - selectCanvas.height, box.y);
+// Clamps imagePanX/Y so the given box (canvas-display px) stays fully
+// covered by drawn image content at the current zoom — panning stops once
+// the image edge would reach the frame edge. This is #8's original pan
+// model: the frame is fixed, only the content under it slides. Generalized
+// here to use the current zoomed draw size instead of always assuming
+// zoom 1 (previously destW/destH == selectCanvas.width/height always).
+function clampPanToBox(box) {
+  if (!box || !pendingImage) return;
+  const scale = selectBaseScale * viewZoom;
+  const destW = pendingImage.width * scale;
+  const destH = pendingImage.height * scale;
+  imagePanX = clamp(imagePanX, box.x + box.w - destW, box.x);
+  imagePanY = clamp(imagePanY, box.y + box.h - destH, box.y);
+}
+
+// Clamps imagePanX/Y so the WHOLE canvas stays covered by drawn image
+// content at the current zoom — the standard image-viewer pan clamp
+// (#7), used whenever the view itself is being navigated (zoom, view-pan
+// drag, keyboard pan) rather than nudging content under an existing
+// frame. At viewZoom 1 this pins pan to (0,0), matching the pre-#7
+// fit-to-view-only behavior exactly.
+function clampPanToCanvas() {
+  if (!pendingImage) return;
+  const scale = selectBaseScale * viewZoom;
+  const destW = pendingImage.width * scale;
+  const destH = pendingImage.height * scale;
+  imagePanX = clamp(imagePanX, selectCanvas.width - destW, 0);
+  imagePanY = clamp(imagePanY, selectCanvas.height - destH, 0);
+}
+
+// Keeps a display-space box's coordinates sane after being reprojected
+// through a transform change — defensive against float drift at extreme
+// zoom/pan rather than anything expected to trigger in normal use.
+function clampBoxToCanvas(box) {
+  const x = clamp(box.x, 0, selectCanvas.width);
+  const y = clamp(box.y, 0, selectCanvas.height);
+  return {
+    x, y,
+    w: clamp(box.w, 0, selectCanvas.width - x),
+    h: clamp(box.h, 0, selectCanvas.height - y),
+  };
+}
+
+// ── View transform (zoom/pan) — screen ⇄ source coordinate mapping ──────
+// selectBaseScale * viewZoom is the current source-px → canvas-display-px
+// scale; imagePanX/Y is the draw offset at that scale. Together these are
+// the single source of truth for every screen↔source conversion below.
+
+function displayToSourcePoint(dx, dy) {
+  const scale = selectBaseScale * viewZoom;
+  return { x: (dx - imagePanX) / scale, y: (dy - imagePanY) / scale };
+}
+
+function sourceToDisplayPoint(sx, sy) {
+  const scale = selectBaseScale * viewZoom;
+  return { x: sx * scale + imagePanX, y: sy * scale + imagePanY };
+}
+
+// Raw (unrounded) display-rect → source-rect. Used internally to keep the
+// selection box visually attached to the same source content while the
+// view transform changes — rounding here would cause visible jitter on
+// every drag tick or wheel notch.
+function displayRectToSourceRect(rect) {
+  const p1 = displayToSourcePoint(rect.x, rect.y);
+  const p2 = displayToSourcePoint(rect.x + rect.w, rect.y + rect.h);
+  return { sx: p1.x, sy: p1.y, sw: p2.x - p1.x, sh: p2.y - p1.y };
+}
+
+function sourceRectToDisplayRect(rect) {
+  const p1 = sourceToDisplayPoint(rect.sx, rect.sy);
+  const p2 = sourceToDisplayPoint(rect.sx + rect.sw, rect.sy + rect.sh);
+  return { x: p1.x, y: p1.y, w: p2.x - p1.x, h: p2.y - p1.y };
+}
+
+// Public mapping: a display-space selection rect → true, integer,
+// bounds-clamped source-image pixels, correct at any zoom/pan state. This
+// is the one function anything downstream of the selection view — the
+// confirm handler below, and #6 (auto-trim) after it — should call rather
+// than re-deriving the scale/pan math directly.
+function selectionRectToSourceRect(rect) {
+  if (!pendingImage) return null;
+  const raw = displayRectToSourceRect(rect);
+  const sw = Math.max(1, Math.min(pendingImage.width, Math.round(raw.sw)));
+  const sh = Math.max(1, Math.min(pendingImage.height, Math.round(raw.sh)));
+  const sx = clamp(Math.round(raw.sx), 0, pendingImage.width - sw);
+  const sy = clamp(Math.round(raw.sy), 0, pendingImage.height - sh);
+  return { sx, sy, sw, sh };
+}
+
+// Applies a new absolute zoom level, keeping the given canvas-display
+// anchor point stationary on screen (cursor-centered when called from the
+// wheel handler; canvas-centered from the zoom buttons/keyboard/Fit). Any
+// existing selection box is reprojected so it stays attached to the same
+// source content through the zoom change.
+function applyZoom(newZoomRaw, anchor) {
+  if (!pendingImage) return;
+  const newZoom = clamp(newZoomRaw, ZOOM_MIN, ZOOM_MAX);
+  const sourceAnchor = displayToSourcePoint(anchor.x, anchor.y);
+  const sourceBoxRect = selectionBox ? displayRectToSourceRect(selectionBox) : null;
+
+  viewZoom = newZoom;
+  const scale = selectBaseScale * viewZoom;
+  imagePanX = anchor.x - sourceAnchor.x * scale;
+  imagePanY = anchor.y - sourceAnchor.y * scale;
+  clampPanToCanvas();
+
+  if (sourceBoxRect) selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(sourceBoxRect));
+  redrawSelectCanvasBackground();
+  updateSelectRectEl();
+  updateZoomReadout();
+}
+
+function zoomBy(factor, anchor) {
+  applyZoom(viewZoom * factor, anchor || { x: selectCanvas.width / 2, y: selectCanvas.height / 2 });
+}
+
+// Whole-view pan by a fixed canvas-display-px delta (keyboard arrow keys).
+// Same reprojection treatment as applyZoom so an existing box stays put
+// relative to its content.
+function panViewBy(dx, dy) {
+  if (!pendingImage) return;
+  const sourceBoxRect = selectionBox ? displayRectToSourceRect(selectionBox) : null;
+  imagePanX += dx;
+  imagePanY += dy;
+  clampPanToCanvas();
+  if (sourceBoxRect) selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(sourceBoxRect));
+  redrawSelectCanvasBackground();
+  updateSelectRectEl();
+}
+
+function updateZoomReadout() {
+  selectZoomReadout.textContent = Math.round(viewZoom * 100) + '%';
+  selectZoomOutBtn.disabled = viewZoom <= ZOOM_MIN + 1e-6;
+  selectZoomInBtn.disabled = viewZoom >= ZOOM_MAX - 1e-6;
+}
+
+function isFormField(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || el.isContentEditable;
 }
 
 function clearSelectionBox() {
   selectionBox = null;
   dragOrigin = null;
   dragMode = null;
-  imagePanX = 0;
-  imagePanY = 0;
   redrawSelectCanvasBackground();
   selectRectEl.style.display = 'none';
   selectConfirmBtn.disabled = true;
@@ -431,10 +590,15 @@ function pointInBox(p) {
     p.y >= selectionBox.y && p.y <= selectionBox.y + selectionBox.h;
 }
 
-// Hover feedback only (not part of any drag) — signals which of the three
-// interactions (resize / pan / new-box) a mousedown here would start.
+// Hover feedback only (not part of any drag) — signals which of the four
+// interactions (view-pan / resize / pan / new-box) a mousedown here would
+// start. Space-held (or an implicit middle-click) always means "pan the
+// view", regardless of what's under the cursor — same convention as
+// Photoshop/Figma/Illustrator's hold-to-pan, chosen so it never collides
+// with plain left-drag drawing a new marquee.
 selectCanvas.addEventListener('mousemove', e => {
   if (dragMode) return;
+  if (spacePanning) { selectCanvas.style.cursor = 'grab'; return; }
   const p = eventToCanvasPoint(e);
   const handle = hitTestHandle(p);
   if (handle) {
@@ -447,8 +611,22 @@ selectCanvas.addEventListener('mousemove', e => {
 });
 
 selectCanvas.addEventListener('mousedown', e => {
+  if (!pendingImage) return;
   e.preventDefault();
   const p = eventToCanvasPoint(e);
+
+  if (spacePanning || e.button === 1) {
+    dragMode = 'view-pan';
+    viewPanDragStart = {
+      x: p.x, y: p.y, panX: imagePanX, panY: imagePanY,
+      sourceBoxRect: selectionBox ? displayRectToSourceRect(selectionBox) : null,
+    };
+    selectCanvas.style.cursor = 'grabbing';
+    document.addEventListener('mousemove', onSelectDrag);
+    document.addEventListener('mouseup', onSelectDragEnd);
+    return;
+  }
+
   const handle = hitTestHandle(p);
 
   if (handle) {
@@ -466,14 +644,17 @@ selectCanvas.addEventListener('mousedown', e => {
   } else {
     dragMode = 'new';
     dragOrigin = p;
-    imagePanX = 0;
-    imagePanY = 0;
-    redrawSelectCanvasBackground();
     selectionBox = { x: p.x, y: p.y, w: 0, h: 0 };
   }
   updateSelectRectEl();
   document.addEventListener('mousemove', onSelectDrag);
   document.addEventListener('mouseup', onSelectDragEnd);
+});
+
+// Middle-click alone (no drag) shouldn't open the OS autoscroll icon or
+// context menu in browsers that treat it that way.
+selectCanvas.addEventListener('auxclick', e => {
+  if (e.button === 1) e.preventDefault();
 });
 
 function onSelectDrag(e) {
@@ -501,13 +682,22 @@ function onSelectDrag(e) {
     nx = clamp(nx, 0, selectCanvas.width - nw);
     ny = clamp(ny, 0, selectCanvas.height - nh);
     selectionBox = { x: nx, y: ny, w: nw, h: nh };
-    clampPan(selectionBox);
+    clampPanToBox(selectionBox);
     redrawSelectCanvasBackground();
   } else if (dragMode === 'pan') {
     if (!panDragStart) return;
     imagePanX = panDragStart.panX + (p.x - panDragStart.x);
     imagePanY = panDragStart.panY + (p.y - panDragStart.y);
-    clampPan(selectionBox);
+    clampPanToBox(selectionBox);
+    redrawSelectCanvasBackground();
+  } else if (dragMode === 'view-pan') {
+    if (!viewPanDragStart) return;
+    imagePanX = viewPanDragStart.panX + (p.x - viewPanDragStart.x);
+    imagePanY = viewPanDragStart.panY + (p.y - viewPanDragStart.y);
+    clampPanToCanvas();
+    if (viewPanDragStart.sourceBoxRect) {
+      selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(viewPanDragStart.sourceBoxRect));
+    }
     redrawSelectCanvasBackground();
   }
   updateSelectRectEl();
@@ -522,7 +712,7 @@ function onSelectDragEnd() {
     if (!valid) {
       selectionBox = null;
     } else {
-      clampPan(selectionBox);
+      clampPanToBox(selectionBox);
     }
     selectConfirmBtn.disabled = !valid;
     updateSelectRectEl();
@@ -530,10 +720,15 @@ function onSelectDragEnd() {
   // 'resize' and 'pan' drags only ever run against an already-valid
   // selectionBox, so confirm stays enabled and no correction is needed.
 
+  if (dragMode === 'view-pan') {
+    selectCanvas.style.cursor = spacePanning ? 'grab' : 'crosshair';
+  }
+
   dragOrigin = null;
   dragMode = null;
   resizeAnchor = null;
   panDragStart = null;
+  viewPanDragStart = null;
 }
 
 selectClearBtn.addEventListener('click', clearSelectionBox);
@@ -606,24 +801,74 @@ function centerSubjectInFrame() {
   const subjectCy = (minY + maxY + 1) / 2;
   imagePanX += fw / 2 - subjectCx;
   imagePanY += fh / 2 - subjectCy;
-  clampPan(selectionBox);
+  clampPanToBox(selectionBox);
   redrawSelectCanvasBackground();
   updateSelectRectEl();
 }
 
+// ── Zoom / pan the sheet view (#7) ───────────────────────────────────────
+// Scroll-wheel zoom, centered on the cursor. Guarded against an in-progress
+// drag so a wheel notch mid-resize/pan can't fight with the mouse.
+selectCanvas.addEventListener('wheel', e => {
+  if (!pendingImage || dragMode) return;
+  e.preventDefault();
+  const factor = Math.pow(ZOOM_WHEEL_STEP, -Math.sign(e.deltaY));
+  zoomBy(factor, eventToCanvasPoint(e));
+}, { passive: false });
+
+selectZoomInBtn.addEventListener('click', () => zoomBy(ZOOM_BUTTON_STEP));
+selectZoomOutBtn.addEventListener('click', () => zoomBy(1 / ZOOM_BUTTON_STEP));
+selectZoomFitBtn.addEventListener('click', () => {
+  applyZoom(1, { x: selectCanvas.width / 2, y: selectCanvas.height / 2 });
+});
+
+// Keyboard equivalents on the canvas itself: +/- zoom, 0 resets to fit,
+// arrow keys pan (a no-op at fit-to-view, where clampPanToCanvas pins pan
+// to 0). The zoom buttons above are the primary keyboard path — this is a
+// secondary affordance for anyone tabbed into the canvas directly.
+selectCanvas.addEventListener('keydown', e => {
+  if (!pendingImage) return;
+  let handled = true;
+  if (e.key === '+' || e.key === '=') zoomBy(ZOOM_BUTTON_STEP);
+  else if (e.key === '-' || e.key === '_') zoomBy(1 / ZOOM_BUTTON_STEP);
+  else if (e.key === '0') applyZoom(1, { x: selectCanvas.width / 2, y: selectCanvas.height / 2 });
+  else if (e.key === 'ArrowLeft') panViewBy(-PAN_KEY_STEP, 0);
+  else if (e.key === 'ArrowRight') panViewBy(PAN_KEY_STEP, 0);
+  else if (e.key === 'ArrowUp') panViewBy(0, -PAN_KEY_STEP);
+  else if (e.key === 'ArrowDown') panViewBy(0, PAN_KEY_STEP);
+  else handled = false;
+  if (handled) e.preventDefault();
+});
+
+// Space held = pan-anywhere mode (mousedown handler above checks
+// spacePanning), matching the standard hold-to-pan convention used by
+// Photoshop/Figma/Illustrator. Scoped to while the selection view is open
+// and guarded against form fields so it doesn't hijack space's normal
+// behavior (activating a focused button, typing a space) elsewhere on the
+// page.
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space' || !pendingImage || isFormField(e.target)) return;
+  if (!spacePanning) {
+    spacePanning = true;
+    if (!dragMode) selectCanvas.style.cursor = 'grab';
+  }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  if (e.code !== 'Space') return;
+  spacePanning = false;
+  if (!dragMode) selectCanvas.style.cursor = 'crosshair';
+});
+
 selectConfirmBtn.addEventListener('click', () => {
   if (!pendingImage || !selectionBox) return;
 
-  // Map the on-screen selection back to true source-image pixels, taking
-  // the current pan offset into account — never crop from the downscaled
-  // display canvas, and always crop from wherever the image content
-  // actually sits under the fixed frame right now.
-  const scaleX = pendingImage.width / selectCanvas.width;
-  const scaleY = pendingImage.height / selectCanvas.height;
-  const sw = Math.max(1, Math.round(selectionBox.w * scaleX));
-  const sh = Math.max(1, Math.round(selectionBox.h * scaleY));
-  const sx = clamp(Math.round((selectionBox.x - imagePanX) * scaleX), 0, pendingImage.width - sw);
-  const sy = clamp(Math.round((selectionBox.y - imagePanY) * scaleY), 0, pendingImage.height - sh);
+  // Map the on-screen selection back to true source-image pixels via the
+  // single screen→source mapping function (selectionRectToSourceRect,
+  // defined above with the rest of the view-transform helpers) — correct
+  // regardless of the current pan/zoom state (#7), not just the pre-#7
+  // fixed-scale case.
+  const { sx, sy, sw, sh } = selectionRectToSourceRect(selectionBox);
 
   // Remember the original sheet and this crop rect (true source pixels) so
   // "Edit crop" can reopen the selection view pre-filled later — separate
@@ -651,17 +896,14 @@ selectConfirmBtn.addEventListener('click', () => {
 // knows how to work with.
 editCropBtn.addEventListener('click', () => {
   if (!lastUploadedSheet) return;
+  // openSelectionView() always resets to fit-to-view (viewZoom 1, pan 0,
+  // per #7) — re-editing a crop reopens at that same default rather than
+  // restoring whatever zoom/pan was active when it was originally
+  // confirmed. Pre-filling the box is a plain source→display projection
+  // at that fit-to-view scale (selectBaseScale, i.e. viewZoom 1).
   openSelectionView(lastUploadedSheet);
   if (lastCropRect) {
-    const scale = selectCanvas.width / lastUploadedSheet.width;
-    selectionBox = {
-      x: lastCropRect.sx * scale,
-      y: lastCropRect.sy * scale,
-      w: lastCropRect.sw * scale,
-      h: lastCropRect.sh * scale,
-    };
-    imagePanX = 0;
-    imagePanY = 0;
+    selectionBox = sourceRectToDisplayRect(lastCropRect);
     updateSelectRectEl();
     selectConfirmBtn.disabled = false;
   }
