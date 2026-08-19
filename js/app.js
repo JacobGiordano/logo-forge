@@ -1045,6 +1045,10 @@ function setStatus(msg, cls) {
 
 // ── Main trace ────────────────────────────────────────────────────────────
 document.getElementById('trace-btn').addEventListener('click', async () => {
+  // A trace is about to run (whether from a manual click or scheduleLive()'s
+  // own auto-click) — cancel any other pending live-update timer so it can
+  // never fire again later and trigger a second, unrequested trace.
+  clearTimeout(liveTimer);
   if (!srcImage) return;
   setLoading(true);
   setStatus('Preparing mask…');
