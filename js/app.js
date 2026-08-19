@@ -329,6 +329,7 @@ const selectClearBtn = document.getElementById('select-clear-btn');
 const selectChangeBtn = document.getElementById('select-change-btn');
 const selectCrosshairBtn = document.getElementById('select-crosshair-btn');
 const selectCenterBtn = document.getElementById('select-center-btn');
+const selectAutoTrimBtn = document.getElementById('select-autotrim-btn');
 const selectZoomOutBtn = document.getElementById('select-zoom-out-btn');
 const selectZoomInBtn = document.getElementById('select-zoom-in-btn');
 const selectZoomFitBtn = document.getElementById('select-zoom-fit-btn');
@@ -360,6 +361,16 @@ const PAN_KEY_STEP = 40; // canvas display px per arrow-key press
 let selectBaseScale = 1; // source px → canvas display px at viewZoom 1
 let viewZoom = 1;
 let spacePanning = false; // true while space is held — drag-anywhere pans the view
+
+// #6 auto-trim — persists across selection-view sessions like showCrosshair
+// (a sticky user preference, not per-image state), so it isn't silently
+// reset by openSelectionView(). Defaults on: the whole point of the
+// feature is that a loose selection is good enough, so the benefit should
+// apply without the user having to discover and flip a switch first. Users
+// with deliberate whitespace-in-selection needs (the documented non-goal)
+// disable it with one click, same cost as the default-off alternative
+// would have imposed on everyone else.
+let autoTrimEnabled = true;
 
 function openSelectionView(img) {
   pendingImage = img;
@@ -744,6 +755,12 @@ selectCrosshairBtn.addEventListener('click', () => {
   updateSelectRectEl();
 });
 
+selectAutoTrimBtn.addEventListener('click', () => {
+  autoTrimEnabled = !autoTrimEnabled;
+  selectAutoTrimBtn.classList.toggle('active', autoTrimEnabled);
+  selectAutoTrimBtn.setAttribute('aria-pressed', String(autoTrimEnabled));
+});
+
 // One-shot re-center: finds the subject's bounding box within the currently
 // visible frame region (reusing the same Otsu-threshold + mask primitives
 // the main trace pipeline uses) and pans the image so that box is centered
@@ -806,6 +823,81 @@ function centerSubjectInFrame() {
   updateSelectRectEl();
 }
 
+// ── Auto-trim (#6) ────────────────────────────────────────────────────────
+// Tightens a loose marquee selection to the bounding box of non-background
+// content found inside it. Reuses the same lightweight luminance + Otsu-
+// threshold + buildMask detection as centerSubjectInFrame just above,
+// rather than the full preprocessImageData trace pipeline — that pipeline
+// applies trace-only settings (despeckle, hole-preservation, upscale) that
+// have nothing to do with finding a subject's extent and would make the
+// trim result depend on whatever the Trace panel's sliders currently say.
+//
+// Deliberately operates on true source-image pixels — drawn fresh into an
+// offscreen canvas from pendingImage — rather than reading back from
+// select-canvas the way centerSubjectInFrame does. centerSubjectInFrame
+// only needs to *pan* the view, so display-resolution pixels are fine; a
+// *trim* decides the actual crop bounds, so it must be correct at whatever
+// zoom the user happened to be at when they clicked confirm (#7), not
+// degrade with the display's downscale.
+const AUTO_TRIM_MARGIN_PX = 2; // small breathing room left around the detected bbox, in source px
+
+function autoTrimSourceRect(sx, sy, sw, sh) {
+  const c = document.createElement('canvas');
+  c.width = sw;
+  c.height = sh;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(pendingImage, sx, sy, sw, sh, 0, 0, sw, sh);
+  const frameData = ctx.getImageData(0, 0, sw, sh);
+
+  const luminance = new Uint8Array(sw * sh);
+  const hist = new Uint32Array(256);
+  let sum = 0;
+  for (let i = 0, px = 0; i < frameData.data.length; i += 4, px++) {
+    const alpha = frameData.data[i + 3] / 255;
+    const lum = (frameData.data[i] * 0.299 + frameData.data[i + 1] * 0.587 + frameData.data[i + 2] * 0.114) * alpha + 255 * (1 - alpha);
+    const rounded = Math.max(0, Math.min(255, Math.round(lum)));
+    luminance[px] = rounded;
+    hist[rounded]++;
+    sum += rounded;
+  }
+
+  // Same auto-polarity heuristic as autoDetect()/centerSubjectInFrame: a
+  // mostly-dark selection means the background is dark and the subject is
+  // the lighter pixels, and vice versa.
+  const threshold = computeOtsuThreshold(hist, luminance.length);
+  const invert = (sum / luminance.length) < 128;
+  const mask = buildMask(luminance, sw, sh, threshold, invert);
+
+  let minX = sw, minY = sh, maxX = -1, maxY = -1;
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      if (mask[y * sw + x]) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  // No distinguishable subject (e.g. a uniform-color selection, or the
+  // whole frame is above/below threshold) — leave the loose rect as-is
+  // rather than collapsing to nothing or guessing.
+  if (maxX < minX || maxY < minY) return { sx, sy, sw, sh };
+
+  const tx0 = clamp(minX - AUTO_TRIM_MARGIN_PX, 0, sw - 1);
+  const ty0 = clamp(minY - AUTO_TRIM_MARGIN_PX, 0, sh - 1);
+  const tx1 = clamp(maxX + AUTO_TRIM_MARGIN_PX, 0, sw - 1);
+  const ty1 = clamp(maxY + AUTO_TRIM_MARGIN_PX, 0, sh - 1);
+
+  return {
+    sx: sx + tx0,
+    sy: sy + ty0,
+    sw: tx1 - tx0 + 1,
+    sh: ty1 - ty0 + 1,
+  };
+}
+
 // ── Zoom / pan the sheet view (#7) ───────────────────────────────────────
 // Scroll-wheel zoom, centered on the cursor. Guarded against an in-progress
 // drag so a wheel notch mid-resize/pan can't fight with the mouse.
@@ -845,9 +937,14 @@ selectCanvas.addEventListener('keydown', e => {
 // Photoshop/Figma/Illustrator. Scoped to while the selection view is open
 // and guarded against form fields so it doesn't hijack space's normal
 // behavior (activating a focused button, typing a space) elsewhere on the
-// page.
+// page. Also exempts BUTTON — isFormField alone (INPUT/SELECT/TEXTAREA)
+// didn't actually cover the "activating a focused button" case this
+// comment always claimed to handle: a focused select-tools button (the #6
+// auto-trim toggle included) would have its native Space-activation
+// silently eaten by this handler's preventDefault() otherwise. Discovered
+// while keyboard-testing #6's new toggle button.
 document.addEventListener('keydown', e => {
-  if (e.code !== 'Space' || !pendingImage || isFormField(e.target)) return;
+  if (e.code !== 'Space' || !pendingImage || isFormField(e.target) || e.target.tagName === 'BUTTON') return;
   if (!spacePanning) {
     spacePanning = true;
     if (!dragMode) selectCanvas.style.cursor = 'grab';
@@ -868,7 +965,18 @@ selectConfirmBtn.addEventListener('click', () => {
   // defined above with the rest of the view-transform helpers) — correct
   // regardless of the current pan/zoom state (#7), not just the pre-#7
   // fixed-scale case.
-  const { sx, sy, sw, sh } = selectionRectToSourceRect(selectionBox);
+  let { sx, sy, sw, sh } = selectionRectToSourceRect(selectionBox);
+
+  // #6: tighten to the subject's bounding box within that source rect.
+  // Runs after the screen→source mapping above, on true source pixels, so
+  // trim tightness never depends on the zoom/pan state the user happened
+  // to be at when confirming. Re-running this on an already-trimmed rect
+  // (e.g. confirming "Edit crop" unchanged, #9) is idempotent — the
+  // detected bbox converges to the same margin-padded rect it started
+  // from — so no special-casing is needed to avoid it "double-trimming".
+  if (autoTrimEnabled) {
+    ({ sx, sy, sw, sh } = autoTrimSourceRect(sx, sy, sw, sh));
+  }
 
   // Remember the original sheet and this crop rect (true source pixels) so
   // "Edit crop" can reopen the selection view pre-filled later — separate
