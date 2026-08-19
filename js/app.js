@@ -15,7 +15,7 @@ let currentMaskPreview = null;
 let currentTraceStats = null;
 let detectedInvert = false;
 let selectedColor = '#000000';
-let liveEnabled = false;
+let liveEnabled = true;
 let liveTimer = null;
 
 const CONTROL_DEFS = [
