@@ -1273,23 +1273,44 @@ function buildTraceOptions(settings) {
 // quality-findings.md), the useful alphamax band is roughly 0.0-1.3 with
 // quality degrading noticeably above ~1.0, so most slider positions are
 // concentrated in the sharp end and only the top notch reaches the
-// soft/over-smooth extreme #13 found "clearly worse". The slider's existing
-// default value (1) lands on 0.2 — #13's validated "tight" preset — not
-// potrace's own library default (1.0), which #13 found measurably blunter
-// on real corner/fine-stroke content than even the pre-swap tracer.
-const ALPHAMAX_BY_CORNER_SMOOTHING = [0.0, 0.2, 0.5, 1.0, 1.3];
+// soft/over-smooth extreme #13 found "clearly worse".
+//
+// The slider's default value (1) lands on 0.35, not #13's literal "tight"
+// preset value of 0.2 (#16 fix). At alphamax=0.2, potrace classifies nearly
+// every point as a hard corner and emits straight-line segments — with no
+// curve segments generated, `opttolerance`/curve-fit (below) has nothing to
+// optimize and is a near-total no-op at the default, confirmed via a full
+// slider-range sweep producing byte-identical output on axis-aligned
+// content and only a sub-1KB/imperceptible wobble on real detailed icon
+// content (see issue #16). 0.35 was chosen empirically, not guessed: swept
+// 0.2-0.5 against a real 240x240 icon crop (_system/potrace-spike/
+// crop-icons.png) both directly via potrace-wasm (bypassing the slider's
+// quantization) and through the live app UI at realistic near-default
+// curve-fit positions. It measurably widens curve-fit's effective range
+// (near-default byte swing 1.1KB->1.6KB, full-range-sweep pixel diff count
+// 415->600 px) while a 254x254 screenshot diff against 0.2 shows only
+// sub-pixel/anti-aliasing-scale change (393 px, ~0.6% of the canvas, no
+// visible corner blunting) — well short of the ~1.0+ zone #13 found
+// measurably softer. Path/hole counts (91/10 on the icon crop) are
+// unchanged from 0.2, confirming this is a curve-fitting precision change,
+// not a structural/topology one.
+const ALPHAMAX_BY_CORNER_SMOOTHING = [0.0, 0.35, 0.5, 1.0, 1.3];
 function cornerSmoothingToAlphamax(cornerSmoothing) {
   const idx = Math.max(0, Math.min(ALPHAMAX_BY_CORNER_SMOOTHING.length - 1, Math.round(cornerSmoothing)));
   return ALPHAMAX_BY_CORNER_SMOOTHING[idx];
 }
 
 // curve-fit slider (0.1-6, continuous) → potrace's `opttolerance` curve-fit
-// tolerance. Quadratic (not linear), anchored so the slider's existing
-// default (1.4) lands on opttolerance=0.05 — #13's validated "tight" preset
-// — rather than potrace's own library default (0.2). The quadratic curve
-// keeps the low end of the slider sensitive/precise while still reaching
-// #13's "smooth" extreme (~0.8-0.9) near the slider's max. Clamped to a
-// [0.02, 1.0] floor/ceiling — near-zero tolerance risks pathological node
+// tolerance. NOTE: this only optimizes curve segments potrace has already
+// decided to emit at the current `alphamax` (above) — it has nothing to do
+// at very low alphamax, which is exactly what made this slider a near-total
+// no-op at the old alphamax=0.2 default (#16). Quadratic (not linear),
+// anchored so the slider's existing default (1.4) lands on opttolerance=0.05
+// — #13's validated "tight" preset — rather than potrace's own library
+// default (0.2). The quadratic curve keeps the low end of the slider
+// sensitive/precise while still reaching #13's "smooth" extreme (~0.8-0.9)
+// near the slider's max. Clamped to a [0.02, 1.0] floor/ceiling — near-zero
+// tolerance risks pathological node
 // counts on detailed images, and nothing above #13's tested "smooth" point
 // was validated.
 function curveFitToOpttolerance(curveFit) {
