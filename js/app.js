@@ -246,6 +246,13 @@ const SELECT_SKIP_MAX_DIM = 256;
 
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
+  // Kick off the potrace-wasm module load opportunistically here rather
+  // than on page load, so a cold wasm compile never sits on the critical
+  // path of the very first trace — by the time the user finishes tuning
+  // settings and clicks Trace, the module (or its fallback-triggering
+  // failure) has usually already resolved. Idempotent/safe to call on
+  // every upload — loadModule() inside is memoized.
+  PotraceTrace.warm();
   // A fresh upload is not "editing" the previous crop — discard whatever
   // selection state was remembered for the prior image.
   lastUploadedSheet = null;
@@ -1073,10 +1080,34 @@ document.getElementById('trace-btn').addEventListener('click', async () => {
     await tick();
 
     const traceOptions = buildTraceOptions(settings);
-    const tracedata = ImageTracer.imagedataToTracedata(processed.imageData, traceOptions);
-    const svgStr = ImageTracer.getsvgstring(tracedata, traceOptions);
+    let svgStr, traceInfo, engine;
+
+    // Binary tracing defaults to potrace-wasm (issue #14) — the existing
+    // pathscan/internodes/tracepath/batchtracepaths chain in imagetracer.js
+    // stays completely intact as an automatic fallback if the wasm module
+    // fails to load, WebAssembly isn't supported, or the trace call itself
+    // throws for any reason. This inner try/catch is deliberately narrower
+    // than the outer one around this whole handler — only potrace-specific
+    // failures fall back silently; a real bug anywhere else in the pipeline
+    // still surfaces as an error normally.
+    try {
+      if (!PotraceTrace.isSupported()) throw new Error('WebAssembly not supported');
+      const potraceOptions = buildPotraceOptions(settings);
+      const result = await PotraceTrace.trace(processed.imageData, potraceOptions);
+      svgStr = result.svgStr;
+      traceInfo = { pathCount: result.pathCount, holeCount: result.holeCount, segmentCount: result.segmentCount };
+      engine = 'potrace-wasm';
+    } catch (potraceErr) {
+      console.warn('[logo-forge] potrace-wasm unavailable, falling back to built-in tracer:', potraceErr.message);
+      const tracedata = ImageTracer.imagedataToTracedata(processed.imageData, traceOptions);
+      svgStr = ImageTracer.getsvgstring(tracedata, traceOptions);
+      traceInfo = tracedata;
+      engine = 'imagetracer';
+    }
+
     const cleaned = cleanupSVG(svgStr, selectedColor, canvas.width, canvas.height, settings.pathSimplify);
-    const stats = collectTraceStats(tracedata, cleaned, processed);
+    const stats = collectTraceStats(traceInfo, cleaned, processed);
+    stats.engine = engine;
 
     currentSVG = cleaned;
     currentMaskPreview = processed.previewUrl;
@@ -1233,6 +1264,59 @@ function buildTraceOptions(settings) {
       { r: 0, g: 0, b: 0, a: 255 },
       { r: 255, g: 255, b: 255, a: 255 },
     ],
+  };
+}
+
+// corner-smoothing slider (0-4, integer) → potrace's `alphamax` corner-angle
+// threshold. Deliberately NOT a linear rescale of the old rightangleenhance
+// range — per #13's tuned-settings finding (_system/potrace-curve-
+// quality-findings.md), the useful alphamax band is roughly 0.0-1.3 with
+// quality degrading noticeably above ~1.0, so most slider positions are
+// concentrated in the sharp end and only the top notch reaches the
+// soft/over-smooth extreme #13 found "clearly worse". The slider's existing
+// default value (1) lands on 0.2 — #13's validated "tight" preset — not
+// potrace's own library default (1.0), which #13 found measurably blunter
+// on real corner/fine-stroke content than even the pre-swap tracer.
+const ALPHAMAX_BY_CORNER_SMOOTHING = [0.0, 0.2, 0.5, 1.0, 1.3];
+function cornerSmoothingToAlphamax(cornerSmoothing) {
+  const idx = Math.max(0, Math.min(ALPHAMAX_BY_CORNER_SMOOTHING.length - 1, Math.round(cornerSmoothing)));
+  return ALPHAMAX_BY_CORNER_SMOOTHING[idx];
+}
+
+// curve-fit slider (0.1-6, continuous) → potrace's `opttolerance` curve-fit
+// tolerance. Quadratic (not linear), anchored so the slider's existing
+// default (1.4) lands on opttolerance=0.05 — #13's validated "tight" preset
+// — rather than potrace's own library default (0.2). The quadratic curve
+// keeps the low end of the slider sensitive/precise while still reaching
+// #13's "smooth" extreme (~0.8-0.9) near the slider's max. Clamped to a
+// [0.02, 1.0] floor/ceiling — near-zero tolerance risks pathological node
+// counts on detailed images, and nothing above #13's tested "smooth" point
+// was validated.
+function curveFitToOpttolerance(curveFit) {
+  const raw = 0.05 * Math.pow(curveFit / 1.4, 2);
+  return Math.max(0.02, Math.min(1.0, raw));
+}
+
+// potrace-wasm equivalent of buildTraceOptions(), for the new default trace
+// path (issue #14). turdsize is fixed at 0 — despeckle is already handled
+// upstream by preprocessImageData's mask pipeline (#11/#12), so potrace's
+// own despeckle-equivalent would be redundant double-filtering. The rest of
+// the fixed fields (turnpolicy/opticurve/extractcolors/posterizelevel/
+// posterizationalgorithm) match the exact configuration #12/#13 validated —
+// extractcolors+posterizelevel:2 is how a single already-binary mask cleanly
+// collapses to the two flat layers (dark/light) this app actually uses,
+// not multi-color tracing (explicitly out of scope, see #12 Track B).
+function buildPotraceOptions(settings) {
+  return {
+    turdsize: 0,
+    turnpolicy: 4,
+    opticurve: 1,
+    pathonly: false,
+    extractcolors: true,
+    posterizelevel: 2,
+    posterizationalgorithm: 0,
+    alphamax: cornerSmoothingToAlphamax(settings.cornerSmoothing),
+    opttolerance: curveFitToOpttolerance(settings.curveFit),
   };
 }
 
@@ -1459,18 +1543,30 @@ function makePreviewURL(imageData) {
   return canvas.toDataURL('image/png');
 }
 
-function collectTraceStats(tracedata, svgStr, processed) {
-  const darkestLayerIndex = findDarkestLayerIndex(tracedata.palette);
-  const layer = tracedata.layers[darkestLayerIndex] || [];
+// traceInfo is either the real ImageTracer tracedata shape (fallback path
+// — { palette, layers: [...] }) or a plain precomputed { pathCount,
+// holeCount, segmentCount } object (potrace-wasm path — see
+// js/potrace-trace.js's normalize()/analyzeD(), which approximates these
+// directly from potrace's own output since it has no tracedata.layers
+// structure to walk). Both produce the same stats shape either way.
+function collectTraceStats(traceInfo, svgStr, processed) {
   let pathCount = 0;
   let holeCount = 0;
   let segmentCount = 0;
 
-  layer.forEach(path => {
-    if (!path.isholepath) pathCount++;
-    holeCount += path.holechildren ? path.holechildren.length : 0;
-    segmentCount += path.segments ? path.segments.length : 0;
-  });
+  if (traceInfo && Array.isArray(traceInfo.layers)) {
+    const darkestLayerIndex = findDarkestLayerIndex(traceInfo.palette);
+    const layer = traceInfo.layers[darkestLayerIndex] || [];
+    layer.forEach(path => {
+      if (!path.isholepath) pathCount++;
+      holeCount += path.holechildren ? path.holechildren.length : 0;
+      segmentCount += path.segments ? path.segments.length : 0;
+    });
+  } else if (traceInfo) {
+    pathCount = traceInfo.pathCount || 0;
+    holeCount = traceInfo.holeCount || 0;
+    segmentCount = traceInfo.segmentCount || 0;
+  }
 
   return {
     resolvedThreshold: processed.resolvedThreshold,
