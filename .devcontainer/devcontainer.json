@@ -20,7 +20,8 @@
         "eamodio.gitlens",
         "dbaeumer.vscode-eslint",
         "man-vu.claude-code-usage-dashboard",
-        "simonsiefke.svg-preview"
+        "simonsiefke.svg-preview",
+        "dimokol.claude-notifications"
       ],
       "settings": {
         "terminal.integrated.defaultProfile.linux": "zsh",
