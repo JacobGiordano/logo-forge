@@ -20,7 +20,7 @@ body{
   font-family:'DM Mono',monospace;
   background:var(--bg);
   color:var(--text);
-  min-height:100vh;
+  height:100vh;
   display:flex;
   flex-direction:column;
   font-size:13px;
@@ -706,6 +706,9 @@ input[type=color]{
 
 /* ── RESPONSIVE ── */
 @media (max-width:768px){
+  body{
+    height:auto;
+  }
   .workspace{
     grid-template-columns:1fr;
     overflow:visible;
