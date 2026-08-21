@@ -345,10 +345,21 @@ const selectZoomReadout = document.getElementById('select-zoom-readout');
 
 let selectionBox = null; // {x,y,w,h} in select-canvas display pixels — the frame; stays fixed while panning
 let dragOrigin = null; // origin point for a brand-new box drag
-let dragMode = null; // 'new' | 'resize' | 'pan' | 'view-pan'
+let dragMode = null; // 'new' | 'resize' | 'pan' | 'view-pan' | 'touch-pinch'
 let resizeAnchor = null; // {x,y} — the corner opposite the one being dragged, stays fixed during a resize
 let panDragStart = null; // {x,y,panX,panY} — mouse start + pan offset at start of a box-relative pan drag (#8)
 let viewPanDragStart = null; // {x,y,panX,panY,sourceBoxRect} — same, for a whole-view pan drag (#7)
+// {dist0,zoom0,anchorSrc,sourceBoxRect} — fixed reference captured at the
+// start of a two-finger touch gesture (#23). dist0/zoom0 give the
+// distance→zoom ratio; anchorSrc (source-image px) is the point that was
+// under the finger midpoint at gesture start and stays pinned under the
+// *current* midpoint every frame — this single formula produces pinch-zoom,
+// two-finger pan, and any blend of the two, the same way a real image
+// viewer's pinch gesture behaves. Deliberately NOT recomputed incrementally
+// frame-to-frame (unlike viewPanDragStart's simpler pure-translation case)
+// because zoom is also changing here — anchoring off a moving "current"
+// transform each frame would let small errors compound over the gesture.
+let pinchState = null;
 let imagePanX = 0; // image draw offset (canvas display px) at the current zoom
 let imagePanY = 0;
 let showCrosshair = false;
@@ -380,23 +391,26 @@ let spacePanning = false; // true while space is held — drag-anywhere pans the
 // would have imposed on everyone else.
 let autoTrimEnabled = true;
 
-// Touch-primary devices (phones/tablets) have no whole-view-pan gesture —
-// spacePanning needs a keyboard and the mouse pan-drag mode gates on
-// e.button === 1 (middle-click), so neither is reachable via touch. The
-// selection-view copy below is branched so touch users aren't told to do
-// something that doesn't work. Checked live (not cached) since a device's
-// pointer type can't change mid-session anyway, but re-checking costs
-// nothing and keeps this honest if that ever stops being true.
+// Touch-primary devices (phones/tablets) use a different gesture vocabulary
+// than desktop, not a reduced one: spacePanning needs a keyboard and the
+// mouse pan-drag mode gates on e.button === 1 (middle-click), so neither is
+// reachable via touch — but touch gets its own whole-view pan and zoom via
+// a two-finger gesture (pinch to zoom, two-finger drag to pan; #23) instead
+// of scroll-wheel zoom and space/middle-drag pan. The selection-view copy
+// below is branched so each input mode is told about the gestures that
+// actually work for it. Checked live (not cached) since a device's pointer
+// type can't change mid-session anyway, but re-checking costs nothing and
+// keeps this honest if that ever stops being true.
 function isTouchPrimary() {
   return window.matchMedia('(pointer: coarse)').matches;
 }
 
 const SELECT_HINT_DESKTOP = 'Scroll to zoom, hold space (or middle-drag) to pan, then drag a rectangle around the icon you want to trace';
-const SELECT_HINT_TOUCH = 'Drag to draw a rectangle around the icon you want to trace — drag inside it to move, drag a corner to resize, then confirm';
+const SELECT_HINT_TOUCH = 'Pinch to zoom, drag with two fingers to pan, then drag with one finger to draw a rectangle around the icon you want to trace — drag inside it to move, drag a corner to resize, then confirm';
 const SELECT_CANVAS_LABEL_DESKTOP = 'Selection canvas — scroll or use the zoom buttons to zoom, hold space and drag (or arrow keys) to pan, drag to draw a selection rectangle';
-const SELECT_CANVAS_LABEL_TOUCH = 'Selection canvas — drag to draw a selection rectangle, drag inside it to move, drag a corner handle to resize, tap the zoom buttons to zoom';
+const SELECT_CANVAS_LABEL_TOUCH = 'Selection canvas — pinch to zoom, drag with two fingers to pan, drag with one finger to draw a selection rectangle, drag inside it to move, drag a corner handle to resize, tap the zoom buttons to zoom';
 const SELECT_STATUS_DESKTOP = 'Drag to select a region, then confirm — scroll to zoom';
-const SELECT_STATUS_TOUCH = 'Drag to select a region, then confirm — tap +/− or Fit to zoom';
+const SELECT_STATUS_TOUCH = 'Drag to select a region, then confirm — pinch or tap +/− to zoom, two-finger drag to pan';
 
 function openSelectionView(img) {
   pendingImage = img;
@@ -554,6 +568,31 @@ function zoomBy(factor, anchor) {
   applyZoom(viewZoom * factor, anchor || { x: selectCanvas.width / 2, y: selectCanvas.height / 2 });
 }
 
+// Two-finger touch equivalent of applyZoom (#23): pins pinchState.anchorSrc
+// (the source-image point under the fingers at gesture start, captured once
+// by startPinch) under the CURRENT finger midpoint at the new zoom level.
+// Unlike applyZoom — which re-derives its anchor from the live transform on
+// every call, correct for a stationary cursor plus discrete wheel notches —
+// this uses the gesture-fixed anchor so a moving two-finger midpoint pans
+// the view in the same motion as the zoom, instead of the zoom-only result
+// applyZoom would give if fed a moving anchor. Same downstream primitives
+// otherwise: clampPanToCanvas, box reprojection, redraw, readout.
+function applyPinchZoomPan(newZoomRaw, mid) {
+  if (!pendingImage || !pinchState) return;
+  viewZoom = clamp(newZoomRaw, ZOOM_MIN, ZOOM_MAX);
+  const scale = selectBaseScale * viewZoom;
+  imagePanX = mid.x - pinchState.anchorSrc.x * scale;
+  imagePanY = mid.y - pinchState.anchorSrc.y * scale;
+  clampPanToCanvas();
+
+  if (pinchState.sourceBoxRect) {
+    selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(pinchState.sourceBoxRect));
+  }
+  redrawSelectCanvasBackground();
+  updateSelectRectEl();
+  updateZoomReadout();
+}
+
 // Whole-view pan by a fixed canvas-display-px delta (keyboard arrow keys).
 // Same reprojection treatment as applyZoom so an existing box stays put
 // relative to its content.
@@ -609,13 +648,54 @@ function updateSelectRectEl() {
 // path.
 function eventToCanvasPoint(e) {
   const src = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
-  const rect = selectCanvas.getBoundingClientRect();
+  return clientPointToCanvasPoint(src, selectCanvas.getBoundingClientRect());
+}
+
+// Same clientX/clientY → canvas-display-px mapping as eventToCanvasPoint,
+// but for one specific Touch out of a multi-touch e.touches list (#23's
+// pinch handling needs touches[0] AND touches[1], not just "the first
+// touch" eventToCanvasPoint assumes). Takes rect as a param rather than
+// re-querying getBoundingClientRect() per touch — call it once per
+// touchstart/touchmove and reuse for both touch points.
+function clientPointToCanvasPoint(src, rect) {
   const scaleX = selectCanvas.width / rect.width;
   const scaleY = selectCanvas.height / rect.height;
   return {
     x: clamp((src.clientX - rect.left) * scaleX, 0, selectCanvas.width),
     y: clamp((src.clientY - rect.top) * scaleY, 0, selectCanvas.height),
   };
+}
+
+// Distance and midpoint (canvas-display px) between the two touches driving
+// a pinch gesture — shared by startPinch (gesture start) and onSelectDrag's
+// 'touch-pinch' branch (every subsequent frame).
+function pinchTouchGeometry(e) {
+  const rect = selectCanvas.getBoundingClientRect();
+  const p0 = clientPointToCanvasPoint(e.touches[0], rect);
+  const p1 = clientPointToCanvasPoint(e.touches[1], rect);
+  return {
+    dist: Math.hypot(p1.x - p0.x, p1.y - p0.y),
+    mid: { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 },
+  };
+}
+
+// Starts a two-finger touch gesture (#23): captures the fixed reference
+// frame applyPinchZoomPan needs (see pinchState's declaration comment) and
+// wires up the same document-level move/end listeners the single-touch
+// drag modes use. Called from onSelectDragStart when a second finger lands
+// — any single-touch drag already in progress is torn down by the caller
+// (via onSelectDragEnd) first so state doesn't straddle both gestures.
+function startPinch(e) {
+  const { dist, mid } = pinchTouchGeometry(e);
+  pinchState = {
+    dist0: Math.max(dist, 1), // guards the dist/dist0 ratio below against a divide-by-zero if both fingers land on the same point
+    zoom0: viewZoom,
+    anchorSrc: displayToSourcePoint(mid.x, mid.y),
+    sourceBoxRect: selectionBox ? displayRectToSourceRect(selectionBox) : null,
+  };
+  dragMode = 'touch-pinch';
+  document.addEventListener('touchmove', onSelectDrag, { passive: false });
+  document.addEventListener('touchend', onSelectDragEnd);
 }
 
 // Which corner handle (if any) a canvas point is within tolerance of.
@@ -672,6 +752,19 @@ function onSelectDragStart(e) {
   // during a selection drag, and calling it on a non-cancelable event
   // throws in some environments.
   if (e.cancelable) e.preventDefault();
+
+  // A second finger landing (#23) always wins over whatever single-touch
+  // drag mode was already running — a fresh touchstart fires the moment the
+  // finger count changes, so this also covers "started drawing/panning
+  // with one finger, then added a second." Tear down the old mode first
+  // (onSelectDragEnd already knows how to cleanly discard an in-progress
+  // 'new' box) so state never straddles both gesture types at once.
+  if (e.touches && e.touches.length >= 2) {
+    if (dragMode) onSelectDragEnd();
+    startPinch(e);
+    return;
+  }
+
   const p = eventToCanvasPoint(e);
 
   if (spacePanning || e.button === 1) {
@@ -769,6 +862,13 @@ function onSelectDrag(e) {
       selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(viewPanDragStart.sourceBoxRect));
     }
     redrawSelectCanvasBackground();
+  } else if (dragMode === 'touch-pinch') {
+    // Needs both touch points, not just the touches[0]-only `p` computed
+    // above — bail if a finger already lifted (onSelectDragEnd handles
+    // ending the gesture on that touchend, this is just defensive).
+    if (!pinchState || !e.touches || e.touches.length < 2) return;
+    const { dist, mid } = pinchTouchGeometry(e);
+    applyPinchZoomPan(pinchState.zoom0 * (dist / pinchState.dist0), mid);
   }
   updateSelectRectEl();
 }
@@ -801,6 +901,7 @@ function onSelectDragEnd() {
   resizeAnchor = null;
   panDragStart = null;
   viewPanDragStart = null;
+  pinchState = null;
 }
 
 selectClearBtn.addEventListener('click', clearSelectionBox);

@@ -371,3 +371,181 @@ test.describe('selection UI — touch input (issue #18: mobile drag-select)', ()
     await expect(page.locator('#select-confirm-btn')).toBeEnabled();
   });
 });
+
+test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-finger pan)', () => {
+  test.use({ hasTouch: true });
+
+  // Dispatches a two-finger touchstart -> N touchmove steps (linearly
+  // interpolated from `start` to `end`) -> touchend, both fingers released
+  // together. Same raw-TouchEvent-via-dispatchEvent method as
+  // dispatchTouchDrag above and for the same reason (isolates exactly and
+  // only whether js/app.js itself handles two-finger touch — no
+  // compat-mouse-event synthesis risk). Fixed per-finger `identifier`s
+  // (1 and 2) across the whole gesture, matching how a real multi-touch
+  // sequence keys touches — js/app.js's pinch math reads e.touches[0] and
+  // e.touches[1] positionally, not by identifier, but a real UA always
+  // keeps identifiers stable per finger and this mirrors that.
+  async function dispatchPinchGesture(
+    page: Page,
+    start: { x1: number; y1: number; x2: number; y2: number },
+    end: { x1: number; y1: number; x2: number; y2: number },
+    steps = 4
+  ) {
+    await page.evaluate(({ start, end, steps }) => {
+      const el = document.getElementById('select-canvas')!;
+      const rect = el.getBoundingClientRect();
+      function touchesAt(x1: number, y1: number, x2: number, y2: number) {
+        return [
+          new Touch({ identifier: 1, target: el, clientX: rect.left + x1, clientY: rect.top + y1 }),
+          new Touch({ identifier: 2, target: el, clientX: rect.left + x2, clientY: rect.top + y2 }),
+        ];
+      }
+      function fire(type: string, touches: Touch[]) {
+        el.dispatchEvent(new TouchEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          touches: type === 'touchend' ? [] : touches,
+          targetTouches: type === 'touchend' ? [] : touches,
+          changedTouches: touches,
+        }));
+      }
+      fire('touchstart', touchesAt(start.x1, start.y1, start.x2, start.y2));
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        fire('touchmove', touchesAt(
+          start.x1 + (end.x1 - start.x1) * t, start.y1 + (end.y1 - start.y1) * t,
+          start.x2 + (end.x2 - start.x2) * t, start.y2 + (end.y2 - start.y2) * t,
+        ));
+      }
+      fire('touchend', touchesAt(end.x1, end.y1, end.x2, end.y2));
+    }, { start, end, steps });
+  }
+
+  // Regression coverage for #23: js/app.js's onSelectDragStart now detects
+  // a second touch (e.touches.length >= 2) and routes it to startPinch/
+  // applyPinchZoomPan instead of the single-touch drag state machine.
+  // Spreading two touches apart around a fixed midpoint is pinch-to-zoom;
+  // this pins that it actually changes viewZoom, not just tracks touches[0]
+  // as if it were an ordinary single-touch drag (which would try to draw a
+  // selection box instead and leave the zoom readout at 100%).
+  //
+  // Geometry: canvas is 260x260 (select-sheet.png is 512px wide,
+  // MAX_SELECT_DISPLAY_WIDTH=260 -> selectBaseScale=260/512). Both touches
+  // start 40px apart straddling the canvas center (130,130) and spread to
+  // 80px apart around the same center — a clean 2x distance ratio at a
+  // constant midpoint (pure zoom, no pan component), so the resulting
+  // viewZoom should land on exactly zoom0(1) * 2 = 2 -> "200%", the same
+  // exact-readout style the desktop zoom-button test above uses.
+  test('two-finger pinch-out zooms in, changing the zoom readout', async ({ page }) => {
+    await uploadSheet(page);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+
+    await dispatchPinchGesture(
+      page,
+      { x1: 110, y1: 130, x2: 150, y2: 130 },
+      { x1: 90, y1: 130, x2: 170, y2: 130 },
+    );
+
+    await expect(page.locator('#select-zoom-readout')).toHaveText('200%');
+  });
+
+  // Regression coverage for #23's other half: two fingers translating
+  // together (distance between them unchanged) pans the whole view, the
+  // touch equivalent of the desktop hold-space/middle-drag 'view-pan' drag
+  // mode — distinct from the existing box-relative 'pan' mode (dragging
+  // inside an already-drawn selection), which #20 already covers and which
+  // this gesture doesn't touch.
+  //
+  // clampPanToCanvas pins pan to (0,0) at viewZoom 1 (a fit-to-view image
+  // has nowhere to pan to), so this zooms in one step first (150%, via the
+  // already-covered zoom button) to have room to pan. At that zoom, source
+  // point (60,60) canvas-display px sits inside the sheet's black square
+  // icon (source 40,40-200,200) — same reasoning the desktop box-pan test
+  // above uses for its (60,60) sample point, just re-derived for 150% zoom
+  // instead of 100%. The two-finger translate then drags icon content away
+  // from (60,60) by a large diagonal delta (-300,-300, overshooting the
+  // clamp on purpose so the result doesn't depend on exact pixel math —
+  // same "reliably maxes out the pan" trick the desktop box-pan test uses),
+  // landing on plain white background between the sheet's two icons
+  // instead — a large, unambiguous color change if the pan actually ran.
+  //
+  // Both touch points stay within the 260x260 canvas for the whole gesture
+  // (10-250px range) rather than sweeping off-canvas — clientPointToCanvas
+  // Point (js/app.js) clamps each touch's coordinates into [0, canvas
+  // width/height] individually, so two off-canvas touches on the same side
+  // would both clamp to the same point and collapse the finger spacing to
+  // 0 (discovered while developing this test: the pan silently no-op'd
+  // because of exactly this). Staying in-bounds keeps the 40px spacing
+  // exact throughout while the (-200,-200) midpoint shift still comfortably
+  // overshoots imagePanX/Y's clamp range, so the "maxed out" pan result
+  // doesn't depend on precise arithmetic either.
+  test('two-finger drag (constant finger spacing) pans the view without changing zoom', async ({ page }) => {
+    await uploadSheet(page);
+    await page.locator('#select-zoom-in-btn').click();
+    await expect(page.locator('#select-zoom-readout')).toHaveText('150%');
+
+    const before = await samplePixel(page, 60, 60);
+    expect(before[0]).toBeLessThan(60); // near-black — inside the icon at 150% zoom
+
+    await dispatchPinchGesture(
+      page,
+      { x1: 210, y1: 210, x2: 250, y2: 210 },
+      { x1: 10, y1: 10, x2: 50, y2: 10 }, // same 40px spacing, midpoint shifted by (-200,-200)
+    );
+
+    const after = await samplePixel(page, 60, 60);
+    const dist = Math.hypot(after[0] - before[0], after[1] - before[1], after[2] - before[2]);
+    expect(dist).toBeGreaterThan(100);
+
+    // Constant finger spacing throughout -> zoom must not have drifted.
+    await expect(page.locator('#select-zoom-readout')).toHaveText('150%');
+  });
+
+  // Regression guard: a second finger landing mid single-touch drag must
+  // cleanly hand off to pinch (onSelectDragStart's
+  // `if (dragMode) onSelectDragEnd()` teardown, then startPinch path), not
+  // leave a half-drawn selection box behind or throw. Unlike the two tests
+  // above, this genuinely starts with one touch (a real touchstart with a
+  // single Touch, same as dispatchTouchDrag's #18/#20 sequence — the drag
+  // begins drawing a box), then adds a second touch mid-gesture via another
+  // touchstart carrying both touches, mirroring exactly how a real UA
+  // reports "a second finger just landed."
+  test('a second finger landing mid single-touch drag hands off to pinch instead of drawing a box', async ({ page }) => {
+    await uploadSheet(page);
+    await expect(page.locator('#select-rect')).toBeHidden();
+
+    await page.evaluate(() => {
+      const el = document.getElementById('select-canvas')!;
+      const rect = el.getBoundingClientRect();
+      const mk = (id: number, x: number, y: number) =>
+        new Touch({ identifier: id, target: el, clientX: rect.left + x, clientY: rect.top + y });
+      const fire = (type: string, touches: Touch[]) => el.dispatchEvent(new TouchEvent(type, {
+        bubbles: true, cancelable: true,
+        touches: type === 'touchend' ? [] : touches,
+        targetTouches: type === 'touchend' ? [] : touches,
+        changedTouches: touches,
+      }));
+
+      // One finger down, barely moves — an ordinary single-touch 'new' box
+      // drag (#20), deliberately kept below MIN_SELECT_PX=6 so it's still
+      // an *invalid*, half-drawn box (not yet a real selection) at the
+      // moment the second finger lands — the case onSelectDragEnd's 'new'
+      // branch is supposed to discard rather than leave behind.
+      fire('touchstart', [mk(1, 20, 20)]);
+      fire('touchmove', [mk(1, 23, 22)]);
+
+      // A second finger lands: browsers report this as a fresh touchstart
+      // whose e.touches now holds both points.
+      fire('touchstart', [mk(1, 60, 60), mk(2, 100, 60)]);
+      fire('touchmove', [mk(1, 40, 60), mk(2, 120, 60)]); // spread apart -> pinch-zoom
+      fire('touchend', [mk(1, 40, 60), mk(2, 120, 60)]);
+    });
+
+    // No stray selection box left over from the aborted single-touch drag,
+    // and the zoom did change — proof this went through startPinch, not
+    // onSelectDragStart's single-touch 'new' branch continuing to run.
+    await expect(page.locator('#select-rect')).toBeHidden();
+    const zoomText = await page.locator('#select-zoom-readout').textContent();
+    expect(parseInt(zoomText || '0', 10)).toBeGreaterThan(100);
+  });
+});
