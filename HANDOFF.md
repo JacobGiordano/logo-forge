@@ -1,29 +1,28 @@
-Last updated: 2026-08-20
+Last updated: 2026-08-21
 
 ## Status
 
-Issues #11-#17 complete and merged to main, shipped. Binary tracer now defaults to potrace-wasm (tuned), plus a sidebar-scroll fix and a slider-tuning fix found while testing #14, plus new Playwright coverage for all three.
+Issues #11-#18 complete and merged to main, shipped. Binary tracer defaults to tuned potrace-wasm (with fallback); sidebar scrolls independently; both vector-fit sliders work; selection/crop UI (#6-#9) now has Playwright coverage. Issue #19 (Otsu-threshold bug) filed but not started — backlog.
 
 ## Decisions made this session
 
-- Explored in stages before implementing: #11 scoped the swap, #12 spiked it (proved output parity on simple shapes, found color-aware tracing has an unresolved speckle problem — deferred, out of scope), #13 spiked curve quality against real detailed content and found potrace only wins at *tuned* settings, not its own library defaults
-- #14 implemented the binary swap: `js/potrace-wasm.js` (new vendored dep, `esm-potrace-wasm`, ~76KB, wasm inlined, no build step) + `js/potrace-trace.js` (new adapter — bakes potrace's coordinate transform into path data, resolves its `<g>`-level fill onto each `<path>`). Falls back automatically to the original `imagetracer.js` chain (kept fully intact) if wasm fails/unavailable — verified by forcing the failure, not just assumed.
-- Corner-smoothing/curve-fit sliders now drive `alphamax`/`opttolerance` instead of `ltres`/`qtres`. Non-linear mapping — useful `alphamax` range is ~0.2-1.3, quality degrades above ~1.0.
-- #15: sidebar (`.left-panel`) wasn't scrolling independently — `body` had `min-height:100vh` (a floor, not a ceiling) so the whole page grew instead of clipping the sidebar. Fixed with `height:100vh` on desktop; mobile breakpoint gets `body{height:auto}` back to preserve its existing whole-page-scroll behavior.
-- #16: found before shipping (user testing the live app noticed the curve-fit slider "did nothing") — at the originally-shipped default `alphamax=0.2`, potrace treats nearly every point as a corner and emits straight segments, leaving `opttolerance` (curve-fit) nothing to act on; confirmed byte-for-byte identical output across curve-fit's entire range. Fixed by bumping the default `alphamax` (`ALPHAMAX_BY_CORNER_SMOOTHING` index 1 in `js/app.js`) from `0.2` to `0.35` — smallest bump that gave curve-fit real effect (1.1KB→1.6KB swing near-default) without reintroducing the corner-blunting #13 rejected (~0.5% pixel diff, no visible softening). Curve-fit's default value/formula unchanged.
-- Color-aware (multi-layer) tracing intentionally NOT built — #12 found ~93% of paths were anti-aliasing speckle fragments at usable posterize levels. Needs its own spike on despeckling before it's worth scoping.
-- Lesson for next time: #14 verified each slider's effect but not the two "Vector fit" sliders *together* at shipped defaults — that combination is what hid the #16 bug. Worth a standing check when tuning coupled parameters: sweep each control in isolation at the OTHER's default, not just at its own extremes.
-- #17: added `tests/potrace.spec.ts` (6 tests) — fallback-path (stubs `WebAssembly` away, asserts the exact console-warning fallback message fires, not just that tracing completes), load-timing race (delays the wasm fetch to force a genuine race between upload-time warm-up and click-time trace; confirms module-load memoization dedupes to one fetch), and full-range slider sweep coverage. No app bugs found — confirmed the trace button's synchronous pre-`await` disable already prevents double-fire at the browser level, so the race test passing reflects real existing defensive behavior, not luck.
+- #11-#17 (potrace-wasm arc): binary tracer now defaults to potrace-wasm, tuned (`alphamax=0.35`, non-linear slider mapping — see `js/app.js` `cornerSmoothingToAlphamax()`/`curveFitToOpttolerance()`), falls back to the original `imagetracer.js` chain if wasm is unavailable. Color-aware tracing deliberately NOT built — #12 found ~93% speckle-fragment paths, needs its own despeckle spike first. Full history in closed issues #11-#17 if needed; not re-summarized here.
+- #18: user reported mobile drag-to-select doesn't work. Confirmed in code: `js/app.js`'s `selectCanvas` only listens for `mousedown`/`mousemove`/`mouseup` — zero touch/pointer event handling. Added `tests/selection.spec.ts` (12 desktop tests covering #6-#9: draw/resize/pan/zoom/clear/confirm, both auto-trim on and off) plus a `test.fail()`-annotated touch test that dispatches real `TouchEvent`s and confirms **nothing happens at all** (no partial drag — `dragMode`/`selectionBox` never set). That `test.fail()` is a deliberate tripwire: it'll flip to a real failure once touch support is added, forcing removal of the annotation.
+- New fixtures: `tests/fixtures/select-sheet.png` (512×512, sharp edges) and `select-sheet-aa.png` (same, anti-aliased) — needed since the existing `test-logo.png` (32×32) is under the app's 256px selection-view threshold.
+- #19 (not started, backlog): found while building #18's fixtures — `computeOtsuThreshold()` returns exactly `0` on perfectly bimodal images (only 2 histogram bins, e.g. flat vector-style exports), and two call sites use it unclamped: `autoTrimSourceRect` (#6 auto-trim) and `centerSubjectInFrame` (#8 Center button) both silently no-op as a result. The main trace pipeline's own Otsu mode already clamps correctly — not affected. Repro is `tests/selection.spec.ts`'s second `test.fail()` block.
+- Lesson carried forward from #16: when tuning/testing coupled controls, sweep each in isolation at the OTHER's default, not just each at its own extremes — that's what hid #16's bug.
 
 ## Next issues
 
-- Still no Playwright coverage of the selection UI (#6-#9) — longstanding gap, not addressed this round
-- `logo-forge.html` (alt entry point) remains out of sync with all feature work since before #6 — worth a decision on whether it's still meant to be live
-- Color-aware tracing: needs a despeckle-focused spike before it's a real issue (see #12 findings)
+- Mobile touch support for the selection UI: add touch/pointer event handling to `js/app.js`'s `selectCanvas` (`mousedown`/`mousemove`/`mouseup` handlers, ~line 617-669). `tests/selection.spec.ts`'s `test.fail()` touch test is the acceptance target — remove the annotation once it passes.
+- #19: fix the Otsu-threshold-returns-0 bug (see above) — separate root cause from the touch gap, intentionally not bundled.
+- `logo-forge.html` (alt entry point) still out of sync with all feature work since before #6 — undecided whether it's still meant to be live.
+- Color-aware tracing: needs a despeckle-focused spike before it's a real issue (see #12 findings).
 
 ## Gotchas
 
 - Plain static HTML/JS app — no build step, no framework
-- Binary tracing now tries potrace-wasm first, falls back to `imagetracer.js` silently — any change to the trace path needs to be tested against both engines
+- Binary tracing tries potrace-wasm first, falls back to `imagetracer.js` silently — test changes against both engines
+- Selection UI only appears for images >256px in the relevant dimension; smaller images skip straight to tracing
 - `body{height:100vh}` on desktop is load-bearing for the sidebar's internal scroll; the mobile media query overrides it back to `auto` — don't remove either half independently
-- Live-update debounce is 350ms (`scheduleLive()` in `js/app.js`); all trace triggers must go through the `#trace-btn` click handler's `clearTimeout(liveTimer)` guard
+- Live-update debounce is 350ms (`scheduleLive()` in `js/app.js`); all trace triggers must go through `#trace-btn`'s `clearTimeout(liveTimer)` guard
