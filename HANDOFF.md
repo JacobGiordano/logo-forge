@@ -2,7 +2,7 @@ Last updated: 2026-08-20
 
 ## Status
 
-Issues #11-#16 complete and merged to main, shipped. Binary tracer now defaults to potrace-wasm (tuned), plus a sidebar-scroll fix and a slider-tuning fix, both found while testing #14 before shipping.
+Issues #11-#17 complete and merged to main, shipped. Binary tracer now defaults to potrace-wasm (tuned), plus a sidebar-scroll fix and a slider-tuning fix found while testing #14, plus new Playwright coverage for all three.
 
 ## Decisions made this session
 
@@ -13,10 +13,10 @@ Issues #11-#16 complete and merged to main, shipped. Binary tracer now defaults 
 - #16: found before shipping (user testing the live app noticed the curve-fit slider "did nothing") — at the originally-shipped default `alphamax=0.2`, potrace treats nearly every point as a corner and emits straight segments, leaving `opttolerance` (curve-fit) nothing to act on; confirmed byte-for-byte identical output across curve-fit's entire range. Fixed by bumping the default `alphamax` (`ALPHAMAX_BY_CORNER_SMOOTHING` index 1 in `js/app.js`) from `0.2` to `0.35` — smallest bump that gave curve-fit real effect (1.1KB→1.6KB swing near-default) without reintroducing the corner-blunting #13 rejected (~0.5% pixel diff, no visible softening). Curve-fit's default value/formula unchanged.
 - Color-aware (multi-layer) tracing intentionally NOT built — #12 found ~93% of paths were anti-aliasing speckle fragments at usable posterize levels. Needs its own spike on despeckling before it's worth scoping.
 - Lesson for next time: #14 verified each slider's effect but not the two "Vector fit" sliders *together* at shipped defaults — that combination is what hid the #16 bug. Worth a standing check when tuning coupled parameters: sweep each control in isolation at the OTHER's default, not just at its own extremes.
+- #17: added `tests/potrace.spec.ts` (6 tests) — fallback-path (stubs `WebAssembly` away, asserts the exact console-warning fallback message fires, not just that tracing completes), load-timing race (delays the wasm fetch to force a genuine race between upload-time warm-up and click-time trace; confirms module-load memoization dedupes to one fetch), and full-range slider sweep coverage. No app bugs found — confirmed the trace button's synchronous pre-`await` disable already prevents double-fire at the browser level, so the race test passing reflects real existing defensive behavior, not luck.
 
 ## Next issues
 
-- Scout: add fallback-path test (stub `WebAssembly` away, assert trace still completes), a load-timing race test (upload → immediate Trace click before wasm loads, in the spirit of the #10 `liveTimer` fix), and slider-range coverage for `alphamax`/`opttolerance` — note the checkerboard fixture (`tests/fixtures/test-logo.png`) has zero curvature and will stay byte-identical across curve-fit's entire range regardless of tuning (a geometric ceiling, not a bug) — don't use it to assert curve-fit sensitivity, use real curved content instead
 - Still no Playwright coverage of the selection UI (#6-#9) — longstanding gap, not addressed this round
 - `logo-forge.html` (alt entry point) remains out of sync with all feature work since before #6 — worth a decision on whether it's still meant to be live
 - Color-aware tracing: needs a despeckle-focused spike before it's a real issue (see #12 findings)
