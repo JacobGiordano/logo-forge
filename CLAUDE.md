@@ -9,7 +9,6 @@ Logo Forge is a browser-based raster-to-SVG converter for logo cleanup. Upload a
 ```
 logo-forge/
 ├── index.html          # app shell
-├── logo-forge.html      # standalone/alt entry point
 ├── css/
 │   └── styles.css
 ├── js/
