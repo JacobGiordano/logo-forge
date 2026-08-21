@@ -1377,7 +1377,23 @@ function computeOtsuThreshold(hist, total) {
     }
   }
 
-  return threshold;
+  // A perfectly bimodal histogram (e.g. a flat-fill, non-anti-aliased
+  // image with only two populated luminance bins) gives IDENTICAL
+  // between-class variance for every threshold from 1 to 254 -- there's no
+  // intermediate pixel population to shift the class means. The strict `>`
+  // comparison above never displaces the very first candidate that beats
+  // the initial -1 sentinel, which is t at the darkest populated bin (0,
+  // for any image containing a pure-black pixel). That raw 0 is never a
+  // usable threshold: buildMask's `luminance[i] < threshold` becomes
+  // `luminance[i] < 0`, which is false for every pixel, producing an empty
+  // mask no matter how the caller reads it. Clamp at the source rather
+  // than in each caller so every call site -- present and future -- gets a
+  // threshold that can actually bisect a histogram. preprocessImageData
+  // already re-clamps to this same [1,254] range after applying its
+  // threshold bias, so this is a no-op for that call site and only changes
+  // behavior for the two call sites that were using the raw value
+  // unclamped (autoTrimSourceRect, centerSubjectInFrame).
+  return clamp(threshold, 1, 254);
 }
 
 function smoothMask(mask, width, height, passes) {
