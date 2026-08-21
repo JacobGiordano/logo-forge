@@ -330,6 +330,7 @@ const MIN_SELECT_PX = 6; // minimum on-screen drag size before a selection count
 const HANDLE_TOL = 8; // hit-test tolerance (canvas display px) around each corner handle
 
 const selectCanvas = document.getElementById('select-canvas');
+const selectHintEl = document.getElementById('select-hint');
 const selectRectEl = document.getElementById('select-rect');
 const selectConfirmBtn = document.getElementById('select-confirm-btn');
 const selectClearBtn = document.getElementById('select-clear-btn');
@@ -379,6 +380,24 @@ let spacePanning = false; // true while space is held — drag-anywhere pans the
 // would have imposed on everyone else.
 let autoTrimEnabled = true;
 
+// Touch-primary devices (phones/tablets) have no whole-view-pan gesture —
+// spacePanning needs a keyboard and the mouse pan-drag mode gates on
+// e.button === 1 (middle-click), so neither is reachable via touch. The
+// selection-view copy below is branched so touch users aren't told to do
+// something that doesn't work. Checked live (not cached) since a device's
+// pointer type can't change mid-session anyway, but re-checking costs
+// nothing and keeps this honest if that ever stops being true.
+function isTouchPrimary() {
+  return window.matchMedia('(pointer: coarse)').matches;
+}
+
+const SELECT_HINT_DESKTOP = 'Scroll to zoom, hold space (or middle-drag) to pan, then drag a rectangle around the icon you want to trace';
+const SELECT_HINT_TOUCH = 'Drag to draw a rectangle around the icon you want to trace — drag inside it to move, drag a corner to resize, then confirm';
+const SELECT_CANVAS_LABEL_DESKTOP = 'Selection canvas — scroll or use the zoom buttons to zoom, hold space and drag (or arrow keys) to pan, drag to draw a selection rectangle';
+const SELECT_CANVAS_LABEL_TOUCH = 'Selection canvas — drag to draw a selection rectangle, drag inside it to move, drag a corner handle to resize, tap the zoom buttons to zoom';
+const SELECT_STATUS_DESKTOP = 'Drag to select a region, then confirm — scroll to zoom';
+const SELECT_STATUS_TOUCH = 'Drag to select a region, then confirm — tap +/− or Fit to zoom';
+
 function openSelectionView(img) {
   pendingImage = img;
   imagePanX = 0;
@@ -398,7 +417,11 @@ function openSelectionView(img) {
 
   clearSelectionBox();
   updateZoomReadout();
-  setStatus('Drag to select a region, then confirm — scroll to zoom');
+
+  const touch = isTouchPrimary();
+  selectHintEl.textContent = touch ? SELECT_HINT_TOUCH : SELECT_HINT_DESKTOP;
+  selectCanvas.setAttribute('aria-label', touch ? SELECT_CANVAS_LABEL_TOUCH : SELECT_CANVAS_LABEL_DESKTOP);
+  setStatus(touch ? SELECT_STATUS_TOUCH : SELECT_STATUS_DESKTOP);
 }
 
 // Redraws the sheet image onto select-canvas at the current pan/zoom. The
