@@ -576,13 +576,22 @@ function updateSelectRectEl() {
   selectRectEl.classList.toggle('show-crosshair', showCrosshair);
 }
 
+// Shared point-extraction for both input modes: MouseEvents carry
+// clientX/clientY directly; TouchEvents carry them on a Touch inside
+// e.touches (touchstart/touchmove) or e.changedTouches (touchend, where
+// e.touches is already empty). Routing both through this one helper (and
+// both mouse and touch listeners through the same onSelectDrag/
+// onSelectDragEnd state machine below) keeps there from being a second,
+// touch-only copy of the drag logic to drift out of sync with the mouse
+// path.
 function eventToCanvasPoint(e) {
+  const src = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
   const rect = selectCanvas.getBoundingClientRect();
   const scaleX = selectCanvas.width / rect.width;
   const scaleY = selectCanvas.height / rect.height;
   return {
-    x: clamp((e.clientX - rect.left) * scaleX, 0, selectCanvas.width),
-    y: clamp((e.clientY - rect.top) * scaleY, 0, selectCanvas.height),
+    x: clamp((src.clientX - rect.left) * scaleX, 0, selectCanvas.width),
+    y: clamp((src.clientY - rect.top) * scaleY, 0, selectCanvas.height),
   };
 }
 
@@ -628,9 +637,18 @@ selectCanvas.addEventListener('mousemove', e => {
   }
 });
 
-selectCanvas.addEventListener('mousedown', e => {
+// Shared by mousedown and touchstart — same state machine either way (see
+// eventToCanvasPoint above for why). e.button is undefined on a TouchEvent,
+// so the view-pan-via-middle-click branch below is naturally mouse-only
+// without any extra guard; spacePanning (keyboard) applies to either input
+// the same way.
+function onSelectDragStart(e) {
   if (!pendingImage) return;
-  e.preventDefault();
+  // Constructed test events may set `cancelable: false`; only real touch
+  // input needs preventDefault to stop the page from scrolling/zooming
+  // during a selection drag, and calling it on a non-cancelable event
+  // throws in some environments.
+  if (e.cancelable) e.preventDefault();
   const p = eventToCanvasPoint(e);
 
   if (spacePanning || e.button === 1) {
@@ -642,6 +660,8 @@ selectCanvas.addEventListener('mousedown', e => {
     selectCanvas.style.cursor = 'grabbing';
     document.addEventListener('mousemove', onSelectDrag);
     document.addEventListener('mouseup', onSelectDragEnd);
+    document.addEventListener('touchmove', onSelectDrag, { passive: false });
+    document.addEventListener('touchend', onSelectDragEnd);
     return;
   }
 
@@ -667,7 +687,12 @@ selectCanvas.addEventListener('mousedown', e => {
   updateSelectRectEl();
   document.addEventListener('mousemove', onSelectDrag);
   document.addEventListener('mouseup', onSelectDragEnd);
-});
+  document.addEventListener('touchmove', onSelectDrag, { passive: false });
+  document.addEventListener('touchend', onSelectDragEnd);
+}
+
+selectCanvas.addEventListener('mousedown', onSelectDragStart);
+selectCanvas.addEventListener('touchstart', onSelectDragStart, { passive: false });
 
 // Middle-click alone (no drag) shouldn't open the OS autoscroll icon or
 // context menu in browsers that treat it that way.
@@ -676,6 +701,10 @@ selectCanvas.addEventListener('auxclick', e => {
 });
 
 function onSelectDrag(e) {
+  // Touch drag continuation — same defensive cancelable check as
+  // onSelectDragStart, needed here too since this fires on every
+  // touchmove for the duration of the drag.
+  if (e.cancelable && e.touches) e.preventDefault();
   const p = eventToCanvasPoint(e);
 
   if (dragMode === 'new') {
@@ -724,6 +753,8 @@ function onSelectDrag(e) {
 function onSelectDragEnd() {
   document.removeEventListener('mousemove', onSelectDrag);
   document.removeEventListener('mouseup', onSelectDragEnd);
+  document.removeEventListener('touchmove', onSelectDrag);
+  document.removeEventListener('touchend', onSelectDragEnd);
 
   if (dragMode === 'new') {
     const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
