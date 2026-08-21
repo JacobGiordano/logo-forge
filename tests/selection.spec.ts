@@ -267,45 +267,16 @@ test.describe('selection UI — desktop (mouse)', () => {
   });
 });
 
-test.describe('selection UI — known bug found while adding this coverage (not fixed here, Aria\'s lane)', () => {
-  // Discovered while building the auto-trim regression test above: on a
-  // perfectly sharp-edged (non-anti-aliased) selection, #6 auto-trim
-  // silently no-ops instead of tightening the crop. Root-caused, not
-  // guessed — see the readout below and the fuller writeup in the QA
-  // session report.
-  //
-  // computeOtsuThreshold (js/app.js ~1354) walks candidate thresholds
-  // 0..255 and keeps the first one whose between-class variance is
-  // strictly greater than the best seen so far. For a histogram with only
-  // two populated bins (0 and 255 -- exactly what a flat-fill, non-
-  // anti-aliased image produces, e.g. a raster export of clean vector
-  // artwork), the variance is IDENTICAL for every threshold from 1 to 254
-  // -- there's no intermediate pixel population to shift the class means
-  // -- so the strict `>` comparison never displaces the very first
-  // candidate (t=0), and the function returns exactly 0.
-  //
-  // autoTrimSourceRect (js/app.js ~874, backing the "Use selection"
-  // button's #6 behavior) and centerSubjectInFrame (js/app.js ~803,
-  // backing the selection view's "Center" button, a #8 acceptance
-  // criterion) both use that threshold completely unclamped:
-  // buildMask's `luminance[i] < threshold` becomes `luminance[i] < 0`,
-  // which is false for every pixel (luminance is never negative) --
-  // an empty mask, read by both call sites as "no distinguishable
-  // subject", so they silently leave the selection/framing untouched
-  // instead of erroring or doing something visibly wrong.
-  //
-  // The main trace pipeline's own "Auto (Otsu)" threshold mode
-  // (preprocessImageData, js/app.js ~1174) calls the same
-  // computeOtsuThreshold but clamps the result to [1,254] before use
-  // (`clamp(autoThreshold + thresholdBias, 1, 254)`) -- at threshold=1,
-  // `luminance[i] < 1` still correctly isolates pure-black pixels, so
-  // that call site is NOT affected. Verified directly (not assumed): ran
-  // preprocessImageData on a 100x100 sharp-edged black square on white
-  // with default settings -- autoThreshold:0, resolvedThreshold:1,
-  // coverage:0.16 (correct, matches the square's true 16% area). Only
-  // the two unclamped call sites in the selection UI are broken.
+test.describe('selection UI — auto-trim on sharp-edged selections (regression for #19)', () => {
+  // #19 fixed a bug where computeOtsuThreshold (js/app.js ~1354) returned
+  // exactly 0 on perfectly bimodal histograms (e.g. a flat-fill,
+  // non-anti-aliased image), which made auto-trim's mask go empty and
+  // silently no-op instead of tightening the crop. Fixed by clamping
+  // computeOtsuThreshold's result to [1,254] at the source. This test
+  // pins that fix: a sharp-edged selection with auto-trim on must come
+  // out meaningfully tighter than the same selection with auto-trim off.
 
-  test.fail('auto-trim silently no-ops on a perfectly sharp-edged selection instead of tightening it (Otsu threshold degenerates to exactly 0)', async ({ page }) => {
+  test('auto-trim tightens a perfectly sharp-edged selection instead of leaving it untrimmed', async ({ page }) => {
     // Same loose rectangle as the passing auto-trim test above, but on
     // SHEET_FIXTURE (sharp/binary edges) instead of AA_SHEET_FIXTURE.
     // First pass: auto-trim OFF, to establish what an untrimmed crop of
@@ -319,11 +290,9 @@ test.describe('selection UI — known bug found while adding this coverage (not 
     const rawWidth = await page.locator('#thumb-img').evaluate((img: HTMLImageElement) => img.naturalWidth);
 
     // Second pass: same rectangle, fresh upload, auto-trim left ON
-    // (default). If auto-trim were working, this should come out
-    // dramatically smaller than rawWidth (tight around the ~160px-wide
-    // square icon, like the AA-fixture test above measures). It doesn't --
-    // this assertion fails because trimmedWidth ends up equal (or
-    // near-equal) to rawWidth, proving no trimming happened at all.
+    // (default). Should come out dramatically smaller than rawWidth
+    // (tight around the ~160px-wide square icon, like the AA-fixture
+    // test above measures), proving auto-trim actually ran.
     await uploadSheet(page, SHEET_FIXTURE);
     await expect(page.locator('#select-autotrim-btn')).toHaveAttribute('aria-pressed', 'true');
     await dragOnCanvas(page, 5, 5, 150, 150);
@@ -382,21 +351,14 @@ test.describe('selection UI — touch input (issue #18: mobile drag-select)', ()
     }, { x1, y1, x2, y2 });
   }
 
-  // EXPECTED TO FAIL right now — this is the acceptance test for the
-  // follow-up mobile-fix issue, not a currently-passing test. There is no
-  // documented "known failure" convention elsewhere in this repo (checked
-  // via `grep -n "test.fail\|test.skip\|fixme" tests/*.spec.ts` before
-  // writing this — no hits in potrace.spec.ts or undo-redo.spec.ts).
-  // Using Playwright's test.fail() rather than .skip()/.fixme(): those two
-  // would hide the gap from `npm test`'s output entirely (a skipped test
-  // doesn't even run its assertions), whereas test.fail() still executes
-  // the full body every run and requires it to actually fail for the run
-  // to count as green — so this stays a live, executed check of the
-  // reported bug rather than a silenced placeholder. If/when the touch fix
-  // lands, this test starts passing, which flips it to a genuine (and
-  // loud) SUITE FAILURE demanding this annotation be removed — that's the
-  // intended trip-wire, not a bug in the test.
-  test.fail('touch drag-select on #select-canvas is a structural no-op (no touch/pointer listeners exist in js/app.js)', async ({ page }) => {
+  // Regression coverage for #20 (mobile touch support): js/app.js now
+  // routes touchstart/touchmove/touchend on #select-canvas through the
+  // same onSelectDragStart/onSelectDrag/onSelectDragEnd state machine as
+  // mouse input, via a shared eventToCanvasPoint helper that resolves
+  // coordinates from e.touches[0]/e.changedTouches[0]/e itself. This
+  // pins that a real touch drag draws a selection box and enables
+  // confirmation, same as the equivalent mouse drag does above.
+  test('touch drag-select on #select-canvas draws a selection box', async ({ page }) => {
     await uploadSheet(page);
     await expect(page.locator('#select-rect')).toBeHidden();
     await expect(page.locator('#select-confirm-btn')).toBeDisabled();
@@ -405,14 +367,6 @@ test.describe('selection UI — touch input (issue #18: mobile drag-select)', ()
     // mouse test above, replayed via touch.
     await dispatchTouchDrag(page, 20, 20, 100, 100);
 
-    // This is where it breaks: with zero touchstart/touchmove/touchend
-    // listeners wired to selectCanvas, dragMode is never set to 'new' and
-    // selectionBox is never created, so the frame never appears at all --
-    // not a partial drag, not a wrong-sized box, literally nothing renders
-    // and nothing about the app's state changes. Confirmed by running this
-    // exact assertion standalone: it fails immediately on this first
-    // expectation, before ever reaching the "Use selection" enablement
-    // check below.
     await expect(page.locator('#select-rect')).toBeVisible();
     await expect(page.locator('#select-confirm-btn')).toBeEnabled();
   });
