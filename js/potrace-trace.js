@@ -43,12 +43,21 @@
 
 	Coordinate rounding/compaction: deliberately NOT duplicated here.
 	Normalized output is handed to app.js's existing compactPathData()
-	unchanged (via cleanupSVG(), unmodified), which already rounds/trims
-	precision per the pathSimplify setting — the same step #12/#13 both
-	flagged as missing from their spike comparisons. Reusing it directly
-	(rather than reimplementing an equivalent) is the literal reading of
-	issue #14 point 4 ("equivalent to the app's existing compactPathData()")
-	and keeps precision behavior identical between both tracers.
+	unchanged (via cleanupSVG(), unmodified), which rounds/trims precision
+	per the pathSimplify setting — the same step #12/#13 both flagged as
+	missing from their spike comparisons. Reusing it directly (rather than
+	reimplementing an equivalent) is the literal reading of issue #14
+	point 4 ("equivalent to the app's existing compactPathData()") and
+	keeps precision behavior identical between both tracers.
+
+	As of #24, compactPathData() also runs a real point/node-reduction pass
+	(Douglas-Peucker over straight-line runs) ahead of precision rounding —
+	previously pathSimplify only trimmed decimals here and had no effect on
+	potrace-wasm output at all (buildPotraceOptions() has no pathSimplify-
+	derived field; only the imagetracer fallback's ltres responded to the
+	slider). Routing potrace-wasm's normalized output through the same
+	unmodified compactPathData() call means this tracer picked up real
+	simplification for free, with no changes needed in this file.
 */
 
 (function () {

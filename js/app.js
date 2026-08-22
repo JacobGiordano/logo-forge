@@ -1824,9 +1824,50 @@ function cleanupSVG(svgStr, color, origW, origH, pathSimplify) {
   return new XMLSerializer().serializeToString(doc);
 }
 
+// path-simplify slider (0-24, integer, default 9) → point/node reduction.
+// Issue #24: the slider used to drive ONLY compactPathData's decimal-
+// precision trim below, which is sub-pixel/imperceptible and was a
+// byte-identical no-op across the entire 0-9 band (including the default).
+// It never touched point count, which is what "simplify" means to a user
+// looking at a path with hundreds of jagged, pixel-grid-traced nodes.
+//
+// Real node reduction now happens here via simplifyPathData() — a
+// Ramer-Douglas-Peucker pass over each subpath's straight-line (L) runs,
+// dropping interior points that fall within `tolerance` px of the chord
+// between the run's endpoints. Deliberately scoped to L-runs only: C/Q
+// curve segments (and their control points) are left completely alone.
+// Curve tolerance is curve-fit's concern (opttolerance, see
+// curveFitToOpttolerance() above, #16) — overlapping that here would blur
+// two sliders into one lever. In practice L-runs are exactly where this
+// matters most: potrace at low/default alphamax (see #16's comment above)
+// and imagetracer both emit long straight-line chains along hard,
+// pixel-stair-stepped edges, and that's precisely the node bloat this
+// slider is supposed to clean up.
+//
+// tolerance = pathSimplify * 0.18 (0px at the slider's minimum, ~1.6px at
+// the default of 9, ~4.3px at the max of 24). The 0.18 slope deliberately
+// matches ltres's own per-step slope in buildTraceOptions() above — that
+// constant already tunes the imagetracer engine's OWN trace-time point
+// generation to this slider, so re-using it here for the post-trace DP
+// pass means both binary-tracing engines land on comparable simplification
+// strength at the same slider position, instead of imagetracer responding
+// to this slider (via ltres) while potrace-wasm ignored it entirely (the
+// core bug in #24 — buildPotraceOptions() has no pathSimplify-derived
+// field at all). Tolerance is in raw traced-canvas pixel units, same
+// unscaled-by-image-size convention as every other trace slider in this
+// file (alphamax, opttolerance, ltres) — a known tradeoff, not a bug: a
+// tiny favicon-sized source simplifies much more aggressively at a given
+// slider position than a large one. Flagged as a possible follow-up, not
+// fixed here (out of scope for #24, which is about node count existing at
+// all, not perfect size-invariance).
+//
+// At pathSimplify=0 the tolerance is exactly 0 and simplifyPathData short-
+// circuits to the original `d` unchanged — slider-off still means
+// "no simplification", not "some arbitrary minimum simplification".
 function compactPathData(d, pathSimplify) {
+  const simplified = simplifyPathData(d, pathSimplify * 0.18);
   const precision = pathSimplify >= 18 ? 1 : pathSimplify >= 10 ? 2 : 3;
-  return d
+  return simplified
     .replace(/-?\d*\.\d+/g, match => trimTrailingZeros(Number(match).toFixed(precision)))
     .replace(/\s+/g, ' ')
     .replace(/\s([A-Z])/g, ' $1')
@@ -1835,6 +1876,200 @@ function compactPathData(d, pathSimplify) {
 
 function trimTrailingZeros(value) {
   return value.replace(/\.?0+$/, '');
+}
+
+// ── Path node reduction (Ramer-Douglas-Peucker on straight-line runs) ────
+// Parses a single <path>'s `d` string (either engine's output — potrace-
+// wasm's baked-absolute-start/relative-rest M/l/c/z, or imagetracer's
+// all-absolute M/L/Q/Z, see potrace-trace.js's bakeD()/analyzeD() for the
+// same dual-format parsing pattern already established there) into
+// subpaths of typed segments, simplifies each maximal run of consecutive
+// line segments in isolation, and re-serializes as absolute commands.
+// Re-serializing to absolute (rather than preserving potrace's relative
+// deltas) is a deliberate simplification: point removal renumbers every
+// downstream relative delta anyway, so reconstructing relative offsets
+// would add real complexity for a secondary (byte-size, not node-count)
+// concern. Measured tradeoff, not a guess: on a real trace (512x512
+// tests/fixtures/select-sheet.png, potrace-wasm engine) this costs ~12%
+// bytes at the low end of the slider (tolerance small enough that few
+// points are actually removed, so absolute coordinates' extra digits
+// aren't offset yet) but is roughly neutral at the slider's default and a
+// net win by the top third once enough points are gone — see #24's PR
+// description for the full sweep. Point/node reduction (this issue's
+// actual ask) is unaffected either way; only the secondary byte-size
+// layer sees a temporary cost at low tolerance. compactPathData's own
+// precision trim (below) still runs on top of this and narrows the gap
+// further, just not all the way to zero at every slider position.
+function simplifyPathData(d, tolerance) {
+  if (!tolerance || tolerance <= 0) return d;
+  const subpaths = parsePathData(d);
+  if (!subpaths.length) return d;
+  return subpaths.map(sp => serializeSubpath(simplifySubpath(sp, tolerance))).join(' ');
+}
+
+function parsePathData(d) {
+  const tokens = d.match(/[MLCQZmlcqz][^MLCQZmlcqz]*/g) || [];
+  const subpaths = [];
+  let cur = null;
+  let cx = 0, cy = 0, sx = 0, sy = 0;
+
+  tokens.forEach(tok => {
+    const cmd = tok[0];
+    const upper = cmd.toUpperCase();
+    const isRel = cmd !== upper;
+    const nums = (tok.slice(1).match(/-?\d*\.?\d+(?:[eE][-+]?\d+)?/g) || []).map(Number);
+
+    if (upper === 'M') {
+      if (cur && cur.segs.length) subpaths.push(cur);
+      cx = isRel ? cx + nums[0] : nums[0];
+      cy = isRel ? cy + nums[1] : nums[1];
+      sx = cx; sy = cy;
+      cur = { start: { x: cx, y: cy }, segs: [] };
+      // SVG allows extra coordinate pairs after an initial moveto to be
+      // treated as an implicit polyline (lineto) — both engines can emit
+      // this for hole subpaths (see imagetracer's svgpathstring()).
+      for (let i = 2; i + 1 < nums.length; i += 2) {
+        cx = isRel ? cx + nums[i] : nums[i];
+        cy = isRel ? cy + nums[i + 1] : nums[i + 1];
+        cur.segs.push({ type: 'L', x: cx, y: cy });
+      }
+    } else if (upper === 'L' && cur) {
+      for (let i = 0; i + 1 < nums.length; i += 2) {
+        cx = isRel ? cx + nums[i] : nums[i];
+        cy = isRel ? cy + nums[i + 1] : nums[i + 1];
+        cur.segs.push({ type: 'L', x: cx, y: cy });
+      }
+    } else if (upper === 'C' && cur) {
+      for (let i = 0; i + 5 < nums.length; i += 6) {
+        const x1 = isRel ? cx + nums[i] : nums[i];
+        const y1 = isRel ? cy + nums[i + 1] : nums[i + 1];
+        const x2 = isRel ? cx + nums[i + 2] : nums[i + 2];
+        const y2 = isRel ? cy + nums[i + 3] : nums[i + 3];
+        const ex = isRel ? cx + nums[i + 4] : nums[i + 4];
+        const ey = isRel ? cy + nums[i + 5] : nums[i + 5];
+        cur.segs.push({ type: 'C', x1, y1, x2, y2, x: ex, y: ey });
+        cx = ex; cy = ey;
+      }
+    } else if (upper === 'Q' && cur) {
+      for (let i = 0; i + 3 < nums.length; i += 4) {
+        const x1 = isRel ? cx + nums[i] : nums[i];
+        const y1 = isRel ? cy + nums[i + 1] : nums[i + 1];
+        const ex = isRel ? cx + nums[i + 2] : nums[i + 2];
+        const ey = isRel ? cy + nums[i + 3] : nums[i + 3];
+        cur.segs.push({ type: 'Q', x1, y1, x: ex, y: ey });
+        cx = ex; cy = ey;
+      }
+    } else if (upper === 'Z' && cur) {
+      cur.segs.push({ type: 'Z' });
+      cx = sx; cy = sy;
+    }
+  });
+  if (cur && cur.segs.length) subpaths.push(cur);
+  return subpaths;
+}
+
+// Simplifies only the maximal consecutive runs of 'L' segments within a
+// subpath, leaving M/C/Q/Z untouched — see simplifyPathData()'s comment
+// above for why curve segments are out of scope here. Each run's fixed
+// endpoints are the point immediately before the run (the subpath's start,
+// or the previous C/Q segment's endpoint) and the run's own last point, so
+// simplification never disturbs where a curve segment attaches.
+function simplifySubpath(sp, tolerance) {
+  const segs = sp.segs;
+  const out = [];
+  let anchor = { x: sp.start.x, y: sp.start.y };
+  let i = 0;
+  while (i < segs.length) {
+    if (segs[i].type === 'L') {
+      let j = i;
+      const runPts = [anchor];
+      while (j < segs.length && segs[j].type === 'L') {
+        runPts.push({ x: segs[j].x, y: segs[j].y });
+        j++;
+      }
+      const kept = douglasPeucker(runPts, tolerance);
+      for (let k = 1; k < kept.length; k++) out.push({ type: 'L', x: kept[k].x, y: kept[k].y });
+      anchor = runPts[runPts.length - 1];
+      i = j;
+    } else {
+      out.push(segs[i]);
+      if (segs[i].type !== 'Z') anchor = { x: segs[i].x, y: segs[i].y };
+      i++;
+    }
+  }
+  return { start: sp.start, segs: out };
+}
+
+// Standard Ramer-Douglas-Peucker, iterative (explicit stack rather than
+// recursive slicing) so a long, near-collinear run of points — common
+// along a straight pixel-grid-traced edge — can't blow the call stack.
+function douglasPeucker(points, tolerance) {
+  const n = points.length;
+  if (n < 3) return points.slice();
+
+  const keep = new Uint8Array(n);
+  keep[0] = 1;
+  keep[n - 1] = 1;
+  const stack = [[0, n - 1]];
+
+  while (stack.length) {
+    const [startIdx, endIdx] = stack.pop();
+    if (endIdx <= startIdx + 1) continue;
+    const a = points[startIdx], b = points[endIdx];
+    let maxDist = -1, idx = -1;
+    for (let i = startIdx + 1; i < endIdx; i++) {
+      const dist = perpendicularDistance(points[i], a, b);
+      if (dist > maxDist) { maxDist = dist; idx = i; }
+    }
+    if (maxDist > tolerance) {
+      keep[idx] = 1;
+      stack.push([startIdx, idx]);
+      stack.push([idx, endIdx]);
+    }
+  }
+
+  const result = [];
+  for (let i = 0; i < n; i++) if (keep[i]) result.push(points[i]);
+  return result;
+}
+
+function perpendicularDistance(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  const projX = a.x + t * dx, projY = a.y + t * dy;
+  return Math.hypot(p.x - projX, p.y - projY);
+}
+
+// SVG lets a single command letter be followed by any number of repeated
+// coordinate groups, implicitly repeating that command — potrace-wasm's
+// native output leans on this heavily (one 'l'/'c' letter followed by many
+// coordinate pairs). Only emitting a fresh letter when the segment type
+// actually changes (rather than once per segment) preserves that
+// compactness instead of fighting it — otherwise re-serialization after
+// simplification would *inflate* byte size relative to the untouched
+// input even when it removed points, which defeats compactPathData's own
+// purpose as a size optimization.
+function serializeSubpath(sp) {
+  let str = 'M ' + sp.start.x + ' ' + sp.start.y + ' ';
+  let lastType = null;
+  sp.segs.forEach(seg => {
+    if (seg.type === 'L') {
+      str += (lastType === 'L' ? '' : 'L ') + seg.x + ' ' + seg.y + ' ';
+      lastType = 'L';
+    } else if (seg.type === 'C') {
+      str += (lastType === 'C' ? '' : 'C ') + seg.x1 + ' ' + seg.y1 + ' ' + seg.x2 + ' ' + seg.y2 + ' ' + seg.x + ' ' + seg.y + ' ';
+      lastType = 'C';
+    } else if (seg.type === 'Q') {
+      str += (lastType === 'Q' ? '' : 'Q ') + seg.x1 + ' ' + seg.y1 + ' ' + seg.x + ' ' + seg.y + ' ';
+      lastType = 'Q';
+    } else if (seg.type === 'Z') {
+      str += 'Z ';
+      lastType = null;
+    }
+  });
+  return str.trim();
 }
 
 function isLightColor(fill) {
