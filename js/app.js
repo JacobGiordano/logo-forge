@@ -207,6 +207,78 @@ CONTROL_DEFS.forEach(({ id, valueId, decimals }) => {
   }
 });
 
+// ── Slider/setting info popovers (#26) ───────────────────────────────────
+// Click/tap-to-toggle is the one interaction guaranteed to work everywhere
+// (a tap synthesizes a click same as a mouse click does, and native <button>
+// Enter/Space activation dispatches 'click' too — so this is also the
+// keyboard path, no separate focus handling needed). That's the baseline
+// for every .info-btn regardless of input mode. On non-touch devices we
+// additionally layer a hover preview on top, gated on isTouchPrimary()
+// (already used to branch selection-view copy in #22 — reused here rather
+// than inventing a second touch-detection mechanism): touch has no hover
+// concept at all, and a coarse pointer's synthetic mouseenter/mouseleave
+// firing around a tap would otherwise fight with the click toggle.
+//
+// Each popover tracks two independent booleans — `pinned` (set by
+// click/tap) and `hovering` (set by mouseenter/mouseleave, desktop only) —
+// and is visible when either is true. Keeping them independent (rather than
+// deriving "is it open" from the visible DOM state) is what lets a desktop
+// click correctly *pin* a tip open even though the mouse necessarily
+// hovers the button first: mouseenter sets hovering=true before the click
+// fires, so a naive "toggle based on current visibility" would immediately
+// re-close what hover just opened.
+//
+// Popovers render as normal in-flow content (see .info-pop in
+// css/styles.css) so there's no floating-position math and nothing that
+// can clip against the sidebar's overflow-x:hidden.
+(function initInfoPopovers() {
+  const touch = isTouchPrimary();
+  const items = Array.from(document.querySelectorAll('.info-btn')).map(btn => {
+    const pop = document.getElementById(btn.getAttribute('aria-controls'));
+    return pop ? { btn, pop, pinned: false, hovering: false } : null;
+  }).filter(Boolean);
+
+  function render(item) {
+    const visible = item.pinned || item.hovering;
+    item.pop.hidden = !visible;
+    item.btn.setAttribute('aria-expanded', String(visible));
+  }
+
+  function closeAll(exceptItem) {
+    items.forEach(item => {
+      if (item === exceptItem) return;
+      item.pinned = false;
+      item.hovering = false;
+      render(item);
+    });
+  }
+
+  items.forEach(item => {
+    item.btn.addEventListener('click', e => {
+      e.stopPropagation();
+      item.pinned = !item.pinned;
+      closeAll(item);
+      render(item);
+    });
+
+    if (!touch) {
+      // Hover target is the whole row, not just the 14px button — the
+      // popover itself renders below the slider (grid-area "info"), so
+      // binding hover to the button alone would fire mouseleave the
+      // instant the cursor moves down off the button toward the text,
+      // closing the tip before it could be read.
+      const row = item.btn.closest('.ctrl-row') || item.btn.parentElement;
+      row.addEventListener('mouseenter', () => { item.hovering = true; render(item); });
+      row.addEventListener('mouseleave', () => { item.hovering = false; render(item); });
+    }
+  });
+
+  document.addEventListener('click', () => closeAll(null));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeAll(null);
+  });
+})();
+
 // ── Color swatches ────────────────────────────────────────────────────────
 document.querySelectorAll('.color-swatch').forEach(sw => {
   sw.addEventListener('click', () => {

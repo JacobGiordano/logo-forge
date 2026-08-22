@@ -288,7 +288,8 @@ header h1 span{color:var(--accent);}
   grid-template-columns:minmax(0,1fr) 56px;
   grid-template-areas:
     "label value"
-    "slider slider";
+    "slider slider"
+    "info info";
   align-items:end;
   gap:8px;
 }
@@ -298,15 +299,75 @@ header h1 span{color:var(--accent);}
   align-items:stretch;
   gap:6px;
 }
+.ctrl-label-row{
+  grid-area:label;
+  display:flex;
+  align-items:center;
+  gap:6px;
+  min-width:0;
+}
 .ctrl-label{
   font-size:11px;
   color:var(--muted);
   min-width:0;
   white-space:normal;
   line-height:1.35;
-  grid-area:label;
 }
 .ctrl-row input[type=range]{grid-area:slider;}
+
+/* Info tooltip/popover — tap-to-open on touch, click or hover on desktop
+   (see isTouchPrimary() branch in js/app.js). Rendered as inline flow
+   content below the row rather than an absolutely-positioned float so it
+   can never get clipped by .left-panel's overflow-x:hidden and never
+   needs viewport-aware repositioning logic. */
+.info-btn{
+  position:relative;
+  flex:0 0 auto;
+  width:14px;
+  height:14px;
+  border-radius:50%;
+  border:1px solid var(--border2);
+  background:transparent;
+  color:var(--muted);
+  font-size:9px;
+  font-style:italic;
+  font-family:'DM Mono',monospace;
+  line-height:1;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+  padding:0;
+  transition:border-color 0.15s,color 0.15s;
+}
+/* Invisible expanded hit area — keeps the visual dot small/unobtrusive
+   next to the label text while still giving touch a real ~30px target
+   (WCAG 2.5.5-friendly) instead of the 14px visible circle. */
+.info-btn::before{
+  content:'';
+  position:absolute;
+  inset:-8px;
+}
+.info-btn:hover,
+.info-btn[aria-expanded="true"]{
+  border-color:var(--accent);
+  color:var(--accent);
+}
+.info-btn:focus-visible{
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+.info-pop{
+  grid-area:info;
+  font-size:10px;
+  line-height:1.5;
+  color:var(--muted);
+  background:var(--s2);
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  padding:8px 10px;
+}
+.info-pop[hidden]{display:none;}
 .ctrl-subhead{
   font-size:10px;
   letter-spacing:0.08em;

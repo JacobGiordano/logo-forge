@@ -75,64 +75,105 @@
       <div class="ctrl">
         <div class="ctrl-subhead">Binary mask</div>
         <div class="ctrl-row ctrl-row-select">
-          <label class="ctrl-label" for="threshold-mode">Threshold mode</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="threshold-mode">Threshold mode</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-threshold-mode" aria-label="What does Threshold mode do?">i</button>
+          </div>
           <select id="threshold-mode">
             <option value="auto">Auto (Otsu)</option>
             <option value="manual">Manual</option>
           </select>
+          <p class="info-pop" id="tip-threshold-mode" role="tooltip" hidden>Chooses how the light/dark split works. Auto (Otsu) picks a brightness cutoff automatically from the image's own tones; Manual lets you set the cutoff yourself with the Threshold slider below.</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="threshold">Threshold</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="threshold">Threshold</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-threshold" aria-label="What does Threshold do?">i</button>
+          </div>
           <input type="range" id="threshold" min="1" max="254" value="128">
           <input type="number" class="val-input" id="v-threshold" data-slider="threshold" min="1" max="254" step="1" value="128">
+          <p class="info-pop" id="tip-threshold" role="tooltip" hidden>Only takes effect in Manual mode. Sets the brightness cutoff separating logo from background — pixels darker than this become part of the traced shape. Raise it to pull in lighter grays as logo; lower it to keep only the darkest pixels.</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="threshold-bias">Threshold bias</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="threshold-bias">Threshold bias</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-threshold-bias" aria-label="What does Threshold bias do?">i</button>
+          </div>
           <input type="range" id="threshold-bias" min="-64" max="64" step="1" value="0">
           <input type="number" class="val-input" id="v-threshold-bias" data-slider="threshold-bias" min="-64" max="64" step="1" value="0">
+          <p class="info-pop" id="tip-threshold-bias" role="tooltip" hidden>Only takes effect in Auto mode. Nudges the automatically detected cutoff up or down. Positive values pull in lighter grays as part of the logo; negative values keep only the darkest pixels.</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="despeckle">Despeckle</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="despeckle">Despeckle</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-despeckle" aria-label="What does Despeckle do?">i</button>
+          </div>
           <input type="range" id="despeckle" min="0" max="400" step="4" value="24">
           <input type="number" class="val-input" id="v-despeckle" data-slider="despeckle" min="0" max="400" step="4" value="24">
+          <p class="info-pop" id="tip-despeckle" role="tooltip" hidden>Removes small stray specks and isolated blobs from the mask before tracing — handy for cleaning scan noise or JPG artifacts. Higher values remove larger specks; 0 turns it off. Too high and it can eat fine details like thin serifs or small dots.</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="hole-preservation">Hole min area</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="hole-preservation">Hole min area</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-hole-preservation" aria-label="What does Hole min area do?">i</button>
+          </div>
           <input type="range" id="hole-preservation" min="0" max="400" step="4" value="12">
           <input type="number" class="val-input" id="v-hole-preservation" data-slider="hole-preservation" min="0" max="400" step="4" value="12">
+          <p class="info-pop" id="tip-hole-preservation" role="tooltip" hidden>Fills small enclosed gaps inside the traced shape — like antialiasing pinholes or dust — instead of leaving them as separate cutouts. Higher values fill larger gaps; 0 leaves every interior hole intact. Too high and it can fill in real design holes, like the counter of an "e" or "o".</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="corner-smoothing">Corner smoothing</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="corner-smoothing">Corner smoothing</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-corner-smoothing" aria-label="What does Corner smoothing do?">i</button>
+          </div>
           <input type="range" id="corner-smoothing" min="0" max="4" step="1" value="1">
           <input type="number" class="val-input" id="v-corner-smoothing" data-slider="corner-smoothing" min="0" max="4" step="1" value="1">
+          <p class="info-pop" id="tip-corner-smoothing" role="tooltip" hidden>Controls how sharp or rounded corners are in the traced outline. At 0, corners stay crisp and geometric; higher values round them off, which can smooth out pixel stair-stepping but will also soften intentionally sharp corners.</p>
         </div>
         <div class="ctrl-subhead">Vector fit</div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="curve-fit">Curve fitting</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="curve-fit">Curve fitting</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-curve-fit" aria-label="What does Curve fitting do?">i</button>
+          </div>
           <input type="range" id="curve-fit" min="0.1" max="6" step="0.1" value="1.4">
           <input type="number" class="val-input" id="v-curve-fit" data-slider="curve-fit" min="0.1" max="6" step="0.1" value="1.4">
+          <p class="info-pop" id="tip-curve-fit" role="tooltip" hidden>Controls how tightly curved segments hug the traced pixel outline. Lower values fit curves more tightly and faithfully; higher values let curves flow more loosely and smoothly. Has little visible effect on shapes with very sharp, geometric corners — it only refines curves the tracer already decided to draw, not straight edges.</p>
         </div>
         <div class="ctrl-row">
-          <label class="ctrl-label" for="path-simplify">Path simplify</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="path-simplify">Path simplify</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-path-simplify" aria-label="What does Path simplify do?">i</button>
+          </div>
           <input type="range" id="path-simplify" min="0" max="24" step="1" value="9">
           <input type="number" class="val-input" id="v-path-simplify" data-slider="path-simplify" min="0" max="24" step="1" value="9">
+          <p class="info-pop" id="tip-path-simplify" role="tooltip" hidden>Reduces the number of points along straight-line sections of the path for a cleaner, smaller SVG — a pure cleanup pass that never touches curved segments. Higher values remove more points; 0 leaves every traced point untouched.</p>
         </div>
         <div class="ctrl-subhead">Supersampling</div>
         <div class="ctrl-row ctrl-row-select">
-          <label class="ctrl-label" for="upscale-factor">Upscale before trace</label>
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="upscale-factor">Upscale before trace</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-upscale-factor" aria-label="What does Upscale before trace do?">i</button>
+          </div>
           <select id="upscale-factor">
             <option value="1">Off</option>
             <option value="2">2×</option>
             <option value="3">3×</option>
             <option value="4">4×</option>
           </select>
+          <p class="info-pop" id="tip-upscale-factor" role="tooltip" hidden>Runs a smoothing upscale pass on the cleaned mask before tracing, giving the tracer more resolution to fit smoother curves against, then scales the result back down. Higher factors can noticeably smooth curves on small source images, at the cost of longer processing time; Off skips this step.</p>
         </div>
-        <div style="margin-top:4px">
+        <div class="ctrl-row ctrl-row-select" style="margin-top:4px">
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="invert">Foreground / background</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-invert" aria-label="What does this setting do?">i</button>
+          </div>
           <select id="invert">
             <option value="auto">Auto-detect bg</option>
             <option value="0">Normal (dark logo, light bg)</option>
             <option value="1">Inverted (light logo, dark bg)</option>
           </select>
+          <p class="info-pop" id="tip-invert" role="tooltip" hidden>Chooses which pixels count as the logo versus the background. Auto-detect guesses this from the image's overall brightness; use Normal for a dark logo on a light background, or Inverted for a light logo on a dark background.</p>
         </div>
         <p class="ctrl-note">The new pipeline cleans the bitmap first, then traces cleaner silhouettes with fewer, smoother paths. Upscaling runs an edge-preserving Scale2x/3x pass on the cleaned mask before tracing for smoother curves, then scales the result back down to the source size.</p>
       </div>
