@@ -8,6 +8,7 @@ async function uploadAndTrace(page: Page, threshold = '128') {
   await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
 
   if (threshold !== '128') {
+    await page.locator('#threshold-mode').selectOption('manual');
     await page.locator('#threshold').fill(threshold);
   }
 
@@ -49,6 +50,7 @@ test('undo restores slider values', async ({ page }) => {
   await uploadAndTrace(page, '100');
 
   // Second trace at threshold 200
+  await page.locator('#threshold-mode').selectOption('manual');
   await page.locator('#threshold').fill('200');
   await page.locator('#trace-btn').click();
   await expect(page.locator('#status')).toHaveText('Done — SVG ready ✓', { timeout: 15000 });
@@ -62,6 +64,7 @@ test('undo restores slider values', async ({ page }) => {
 test('redo restores slider values after undo', async ({ page }) => {
   await uploadAndTrace(page, '100');
 
+  await page.locator('#threshold-mode').selectOption('manual');
   await page.locator('#threshold').fill('200');
   await page.locator('#trace-btn').click();
   await expect(page.locator('#status')).toHaveText('Done — SVG ready ✓', { timeout: 15000 });
@@ -81,6 +84,7 @@ test('new trace after undo clears redo history', async ({ page }) => {
   await expect(page.locator('#redo-btn')).toBeEnabled();
 
   // Trace again — redo stack should clear
+  await page.locator('#threshold-mode').selectOption('manual');
   await page.locator('#threshold').fill('150');
   await page.locator('#trace-btn').click();
   await expect(page.locator('#status')).toHaveText('Done — SVG ready ✓', { timeout: 15000 });
