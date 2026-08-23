@@ -18,6 +18,33 @@ let selectedColor = '#000000';
 let liveEnabled = true;
 let liveTimer = null;
 
+// ── Bilinear-presupersample (issue #34) ─────────────────────────────────
+// Backstop cap on the bilinear-presupersample mechanism's OUTPUT resolution
+// (native longest dimension × 2), independent of the per-attempt Worker
+// try/catch below — defense-in-depth for pathological native sizes beyond
+// the tested 512-4200px range. Above this, bilinear-presupersample isn't
+// attempted at all and the pipeline falls straight back to tracing at
+// native resolution (see preprocessImageData). Reasoning for 10,000
+// specifically: max validated combo is 4200×2=8400px output (see
+// _system/bilinear-presupersample-tracing-findings.md, #32's perf/memory
+// investigation); 10,000 sits ~19% above that with real memory margin below
+// the known ~2.25GB single-buffer failure point. Don't raise this without
+// new measurement; don't lower it below 8400 or it clips the validated
+// range.
+const BILINEAR_OUTPUT_CAP = 10000;
+// Pre-trace advisory threshold — once native×2 is within this fraction of
+// the backstop, show a heads-up before the user hits the cap at trace time
+// (see updateSupersampleAdvisory()), rather than only surfacing it as a
+// post-hoc fallback message.
+const BILINEAR_ADVISORY_RATIO = 0.8;
+// Safety timeout for the bilinear-presupersample Worker round-trip — a hang
+// (as opposed to a clean error) should still fall back rather than stall
+// the trace indefinitely. Generous relative to the worst measured real
+// timing in #32's findings (~1.9s at 3000x3000@4x cheap despeckle; this
+// app only ever requests factor 2, and is capped at 5000x5000 native by
+// BILINEAR_OUTPUT_CAP above, so this margin is large.
+const BILINEAR_WORKER_TIMEOUT_MS = 20000;
+
 const CONTROL_DEFS = [
   { id: 'threshold-mode', valueId: null, decimals: 0 },
   { id: 'threshold', valueId: 'v-threshold', decimals: 0 },
@@ -398,8 +425,32 @@ function finalizeImage(img, dataUrl) {
   document.getElementById('trace-btn').disabled = false;
   updateEditCropButton();
   setStatus('Loaded ' + img.width + '×' + img.height + 'px — ready to trace');
+  updateSupersampleAdvisory(Math.max(img.width, img.height));
   autoDetect(img);
   scheduleLive();
+}
+
+// Pre-trace heads-up (issue #34, Tempo's advisory recommendation): warns
+// the user before they trigger the bilinear-presupersample backstop
+// fallback (BILINEAR_OUTPUT_CAP above), rather than only finding out via
+// the post-trace fallback status message. Shown once native size × 2
+// approaches or exceeds the cap, regardless of the current upscale-factor
+// selection (the control can be changed after upload without a new file
+// load event, so this can't be gated on the dropdown's value at call time).
+function updateSupersampleAdvisory(longestNativeDim) {
+  const el = document.getElementById('supersample-advisory');
+  if (!el) return;
+  const outputAtFactor2 = longestNativeDim * 2;
+  if (outputAtFactor2 > BILINEAR_OUTPUT_CAP) {
+    el.textContent = 'This image is too large for 2× supersampling (output would exceed ~' + BILINEAR_OUTPUT_CAP.toLocaleString() + 'px) — 2× will trace at native resolution instead.';
+    el.hidden = false;
+  } else if (outputAtFactor2 > BILINEAR_OUTPUT_CAP * BILINEAR_ADVISORY_RATIO) {
+    el.textContent = 'Heads up: this image is close to the 2× supersampling size limit (~' + BILINEAR_OUTPUT_CAP.toLocaleString() + 'px output) — tracing may fall back to native resolution.';
+    el.hidden = false;
+  } else {
+    el.hidden = true;
+    el.textContent = '';
+  }
 }
 
 // Shows "edit crop" only when there's an original sheet + prior crop to
@@ -1339,7 +1390,7 @@ document.getElementById('trace-btn').addEventListener('click', async () => {
     const invertSel = settings.invert;
     const doInvert = invertSel === 'auto' ? detectedInvert : invertSel === '1';
 
-    const processed = preprocessImageData(imageData, settings, doInvert);
+    const processed = await preprocessImageData(imageData, settings, doInvert);
 
     setStatus('Tracing cleaned silhouette…');
     await tick();
@@ -1389,7 +1440,16 @@ document.getElementById('trace-btn').addEventListener('click', async () => {
     await renderExportsTab(cleaned);
 
     setLoading(false);
-    setStatus('Done — SVG ready ✓', 'ok');
+    // Bilinear-presupersample fallback (issue #34, condition 2): if
+    // preprocessImageData couldn't run the mechanism (backstop cap or a
+    // caught Worker failure) and traced at native resolution instead, that
+    // must be UI-visible, not a silent console log — surface it here rather
+    // than the default "Done" status, distinct color (see #status.warn).
+    if (processed.fallbackMessage) {
+      setStatus(processed.fallbackMessage + ' SVG ready ✓', 'warn');
+    } else {
+      setStatus('Done — SVG ready ✓', 'ok');
+    }
 
     document.querySelector('[data-tab="svg"]').click();
   } catch (err) {
@@ -1424,13 +1484,25 @@ function readSettings() {
   };
 }
 
-function preprocessImageData(imgData, settings, invert) {
-  const luminance = new Uint8Array(imgData.width * imgData.height);
+async function preprocessImageData(imgData, settings, invert) {
+  const width = imgData.width;
+  const height = imgData.height;
+
+  // Two luminance representations built in one pass: `luminance` is the
+  // existing rounded/quantized Uint8Array (native-resolution Otsu histogram
+  // + today's native mask), and `luminanceContinuous` is the *unrounded*
+  // field the bilinear-presupersample path (below) needs — rounding before
+  // interpolating would throw away the sub-pixel precision that mechanism
+  // exists to preserve (see findings doc's #27 section on why the spike
+  // harness deliberately skipped Math.round() for its bilinear input).
+  const luminanceContinuous = new Float64Array(width * height);
+  const luminance = new Uint8Array(width * height);
   const hist = new Uint32Array(256);
 
   for (let i = 0, px = 0; i < imgData.data.length; i += 4, px++) {
     const alpha = imgData.data[i + 3] / 255;
     const lum = (imgData.data[i] * 0.299 + imgData.data[i + 1] * 0.587 + imgData.data[i + 2] * 0.114) * alpha + 255 * (1 - alpha);
+    luminanceContinuous[px] = lum;
     const rounded = Math.max(0, Math.min(255, Math.round(lum)));
     luminance[px] = rounded;
     hist[rounded]++;
@@ -1443,54 +1515,96 @@ function preprocessImageData(imgData, settings, invert) {
     254
   );
 
-  let mask = buildMask(luminance, imgData.width, imgData.height, resolvedThreshold, invert);
+  // upscale-factor's select now only offers 1 (Off) or 2 (issue #34 — the
+  // old 3×/4× Scale2x options are gone, and "2×" no longer means Scale2x at
+  // all; it now requests the bilinear-presupersample mechanism below.
+  const requestedUpscale = settings.upscaleFactor || 1;
+  const wantsBilinear = requestedUpscale === 2;
 
-  if (settings.cornerSmoothing > 0) {
-    const prePasses = Math.max(1, Math.floor(settings.cornerSmoothing / 2));
-    mask = smoothMask(mask, imgData.width, imgData.height, prePasses);
+  let bilinear = null;
+  let fallbackMessage = null;
+
+  if (wantsBilinear) {
+    const outputLongest = Math.max(width, height) * 2;
+    if (outputLongest > BILINEAR_OUTPUT_CAP) {
+      // Backstop cap, defense-in-depth — see BILINEAR_OUTPUT_CAP's comment.
+      fallbackMessage = 'Image too large for 2× supersampling — traced at native resolution instead.';
+    } else {
+      try {
+        bilinear = await runBilinearPresupersample(
+          luminanceContinuous, luminance, width, height, resolvedThreshold, invert, settings
+        );
+      } catch (err) {
+        // Worker construction/postMessage/runtime failure (e.g. Chromium's
+        // "Array buffer allocation failed" at the memory ceiling #32 found —
+        // now a catchable rejection instead of a tab crash/hang) or the
+        // BILINEAR_WORKER_TIMEOUT_MS safety timeout. Never a silent
+        // console-only failure — always falls back to native tracing and
+        // surfaces a status message (see the trace-btn click handler).
+        console.warn('[logo-forge] bilinear-presupersample failed, falling back to native pipeline:', err && err.message);
+        fallbackMessage = 'Image too large for 2× supersampling — traced at native resolution instead.';
+      }
+    }
   }
 
-  if (settings.despeckle > 0) {
-    mask = removeSmallComponents(mask, imgData.width, imgData.height, settings.despeckle);
+  let mask;
+  let maskWidth = width;
+  let maskHeight = height;
+  let supersampleMode = null; // null | 'bilinear' | 'scale2x-fallback'
+
+  if (bilinear) {
+    mask = bilinear.mask;
+    maskWidth = bilinear.maskWidth;
+    maskHeight = bilinear.maskHeight;
+    supersampleMode = 'bilinear';
+  } else {
+    // Today's existing native-resolution pipeline — unchanged from before
+    // issue #34 whenever bilinear wasn't requested at all (the common,
+    // fully-tested default path). despeckle/hole-preservation area
+    // thresholds here are native-resolution mask-pixel units, same as ever.
+    mask = buildMask(luminance, width, height, resolvedThreshold, invert);
+
+    if (settings.cornerSmoothing > 0) {
+      const prePasses = Math.max(1, Math.floor(settings.cornerSmoothing / 2));
+      mask = smoothMask(mask, width, height, prePasses);
+    }
+
+    if (settings.despeckle > 0) {
+      mask = removeSmallComponents(mask, width, height, settings.despeckle);
+    }
+
+    if (settings.holePreservation > 0) {
+      mask = fillSmallHoles(mask, width, height, settings.holePreservation);
+    }
+
+    if (settings.cornerSmoothing > 1) {
+      mask = smoothMask(mask, width, height, settings.cornerSmoothing - 1);
+    }
+
+    mask = refineMaskEdges(mask, width, height, settings.cornerSmoothing);
+
+    // If the user asked for 2× supersampling and bilinear-presupersample
+    // couldn't run (backstop cap or a caught Worker failure above), fall
+    // back to today's Scale2x-family upscale on this cleaned native mask
+    // rather than dropping the user's "give me more resolution" intent
+    // entirely — see issue #34's report for why this fallback composition
+    // was chosen (Tempo's approval conditions describe today's fallback
+    // pipeline as "native res, optional Scale2x").
+    if (fallbackMessage) {
+      const upscaled = Upscale.upscaleMask(mask, maskWidth, maskHeight, 2);
+      mask = upscaled.data;
+      maskWidth = upscaled.width;
+      maskHeight = upscaled.height;
+      supersampleMode = 'scale2x-fallback';
+    }
   }
 
-  if (settings.holePreservation > 0) {
-    mask = fillSmallHoles(mask, imgData.width, imgData.height, settings.holePreservation);
-  }
-
-  if (settings.cornerSmoothing > 1) {
-    mask = smoothMask(mask, imgData.width, imgData.height, settings.cornerSmoothing - 1);
-  }
-
-  mask = refineMaskEdges(mask, imgData.width, imgData.height, settings.cornerSmoothing);
-
-  // Coverage is measured on the natural-resolution mask, before any
-  // upscaling — despeckle/hole-preservation area thresholds above are
-  // already in natural-resolution mask-pixel units, so this keeps the
-  // reported ratio meaningful regardless of upscale factor.
+  // Coverage is a filled/total ratio — resolution-invariant in practice, so
+  // it's computed once here on whichever mask is final (native, bilinear,
+  // or Scale2x-fallback) rather than needing a path-specific pre-upscale
+  // snapshot.
   const filledPixels = countFilledPixels(mask);
   const coverage = filledPixels / mask.length;
-
-  // Perceptual upscale (Scale2x/3x family, js/upscale.js) runs here — on
-  // the final cleaned binary mask, not the raw grayscale source. A 2-color
-  // mask is exactly the kind of discrete, sharp-edge pixel data this
-  // algorithm family is designed for, and running it after despeckle/hole
-  // fill means those passes never need factor-aware area thresholds. The
-  // upscaled mask (not the natural-resolution one) is what gets rasterized
-  // below and handed to ImageTracer, which is what gives ImageTracer extra
-  // coordinate resolution to fit smoother curves against (supersampled
-  // tracing) — cleanupSVG's viewBox/width/height split then scales the
-  // traced result back down to natural size for display/export.
-  let maskWidth = imgData.width;
-  let maskHeight = imgData.height;
-  const upscaleFactor = settings.upscaleFactor || 1;
-
-  if (upscaleFactor > 1) {
-    const upscaled = Upscale.upscaleMask(mask, maskWidth, maskHeight, upscaleFactor);
-    mask = upscaled.data;
-    maskWidth = upscaled.width;
-    maskHeight = upscaled.height;
-  }
 
   const imageData = maskToImageData(mask, maskWidth, maskHeight);
   const previewUrl = makePreviewURL(imageData);
@@ -1504,8 +1618,126 @@ function preprocessImageData(imgData, settings, invert) {
     previewUrl,
     maskWidth,
     maskHeight,
-    upscaleFactor,
+    upscaleFactor: maskWidth > width ? Math.round(maskWidth / width) : 1,
+    supersampleMode,
+    fallbackMessage,
   };
+}
+
+// ── Bilinear-presupersample orchestration (issue #34) ────────────────────
+// Builds the native-resolution corner-smoothing correction (decision (a) —
+// see issue #34's final report for the full rationale), then hands the
+// corrected continuous luminance field to the dedicated Worker
+// (js/bilinear-worker.js) for the bilinear upsample + Otsu-reused threshold
+// + cheap block-approximate despeckle/hole-fill (issue #32's Direction 3).
+async function runBilinearPresupersample(luminanceContinuous, luminance, width, height, resolvedThreshold, invert, settings) {
+  // Native-resolution mask exactly as today's pipeline would produce it
+  // right after thresholding (before any cleanup) — the reference point
+  // corner-smoothing's "did this pixel's decision change" comparison below
+  // needs.
+  const nativeMask = buildMask(luminance, width, height, resolvedThreshold, invert);
+
+  // Corner-smoothing decision (a): run the SAME corner-smoothing passes
+  // production runs today (smoothMask pre-pass + post-pass, then
+  // refineMaskEdges), but pre-bilinear, entirely on this native mask —
+  // despeckle/hole-fill no longer sit between the two smoothMask passes
+  // here, since they now run post-bilinear (cheap block-approx, inside the
+  // Worker) instead of at native resolution.
+  let smoothedNative = nativeMask;
+  if (settings.cornerSmoothing > 0) {
+    const prePasses = Math.max(1, Math.floor(settings.cornerSmoothing / 2));
+    smoothedNative = smoothMask(smoothedNative, width, height, prePasses);
+    if (settings.cornerSmoothing > 1) {
+      smoothedNative = smoothMask(smoothedNative, width, height, settings.cornerSmoothing - 1);
+    }
+  }
+  smoothedNative = refineMaskEdges(smoothedNative, width, height, settings.cornerSmoothing);
+
+  // Snap ONLY the native pixels corner-smoothing actually changed to a hard
+  // 0/255 luminance value before handing the field to the bilinear
+  // upsampler, so the fine (upsampled) mask agrees with corner-smoothing's
+  // decision there. Every pixel corner-smoothing left untouched keeps its
+  // full continuous, sub-pixel-precision luminance value exactly as
+  // captured from the source image — same "only touch what changed"
+  // pattern as the Worker's cheap despeckle step, applied one stage
+  // earlier, and the reason this composition doesn't undermine the core
+  // mechanism (bilinear still sees untouched continuous data everywhere
+  // corner-smoothing had nothing to say).
+  const corrected = new Float64Array(luminanceContinuous);
+  for (let i = 0; i < corrected.length; i++) {
+    const m = smoothedNative[i];
+    if (m === nativeMask[i]) continue;
+    // buildMask's own convention: dark = lum<threshold, flipped if invert,
+    // mask = dark?1:0. Solve backwards for the "dark" luminance value that
+    // reproduces the desired mask bit `m` through that same comparison.
+    const desiredDark = invert ? !m : !!m;
+    corrected[i] = desiredDark ? 0 : 255;
+  }
+
+  const result = await runBilinearWorker({
+    gray: corrected,
+    w: width,
+    h: height,
+    factor: 2,
+    threshold: resolvedThreshold,
+    invert,
+    despeckleNative: settings.despeckle,
+    holeNative: settings.holePreservation,
+  });
+
+  return { mask: result.mask, maskWidth: result.width, maskHeight: result.height };
+}
+
+// Promise wrapper around js/bilinear-worker.js — construction failure,
+// worker.onerror, an explicit { type: 'error' } response, and a hard
+// timeout (hang protection) all reject; only a clean { type: 'success' }
+// resolves. Every rejection path is caught by preprocessImageData above,
+// which is what makes Worker failures UI-visible instead of silent
+// (issue #34 condition 2).
+function runBilinearWorker(payload) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let worker;
+    let timer;
+
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { worker && worker.terminate(); } catch (_) { /* already gone */ }
+      fn(arg);
+    };
+
+    try {
+      worker = new Worker('js/bilinear-worker.js');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    timer = setTimeout(() => {
+      finish(reject, new Error('bilinear-presupersample Worker timed out'));
+    }, BILINEAR_WORKER_TIMEOUT_MS);
+
+    worker.onmessage = e => {
+      const data = e.data;
+      if (data && data.type === 'success') {
+        finish(resolve, data);
+      } else {
+        finish(reject, new Error((data && data.error) || 'bilinear-presupersample Worker reported an unknown error'));
+      }
+    };
+
+    worker.onerror = e => {
+      finish(reject, new Error((e && e.message) || 'bilinear-presupersample Worker error'));
+    };
+
+    try {
+      worker.postMessage(payload, [payload.gray.buffer]);
+    } catch (err) {
+      finish(reject, err);
+    }
+  });
 }
 
 function buildTraceOptions(settings) {
@@ -1881,6 +2113,7 @@ function collectTraceStats(traceInfo, svgStr, processed) {
     upscaleFactor: processed.upscaleFactor,
     maskWidth: processed.maskWidth,
     maskHeight: processed.maskHeight,
+    supersampleMode: processed.supersampleMode,
   };
 }
 
@@ -2218,8 +2451,9 @@ function renderSVGTab(svgStr, stats, maskPreviewUrl) {
   const holeCount = stats?.holeCount ?? 0;
   const thresholdText = stats ? stats.resolvedThreshold + ' (auto ' + stats.autoThreshold + ')' : 'n/a';
   const coverageText = stats ? Math.round(stats.coverage * 100) + '%' : 'n/a';
+  const supersampleLabel = stats && stats.supersampleMode === 'scale2x-fallback' ? ' Scale2x (native fallback)' : ' bilinear';
   const upscaleChip = (stats && stats.upscaleFactor > 1)
-    ? '<div class="meta-chip">Supersample: <b>' + stats.upscaleFactor + '× (' + stats.maskWidth + '×' + stats.maskHeight + ')</b></div>'
+    ? '<div class="meta-chip">Supersample: <b>' + stats.upscaleFactor + '×' + supersampleLabel + ' (' + stats.maskWidth + '×' + stats.maskHeight + ')</b></div>'
     : '';
 
   document.getElementById('svg-meta').innerHTML =

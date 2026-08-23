@@ -158,10 +158,9 @@
           <select id="upscale-factor">
             <option value="1">Off</option>
             <option value="2">2×</option>
-            <option value="3">3×</option>
-            <option value="4">4×</option>
           </select>
-          <p class="info-pop" id="tip-upscale-factor" role="tooltip" hidden>Runs a smoothing upscale pass on the cleaned mask before tracing, giving the tracer more resolution to fit smoother curves against, then scales the result back down. Higher factors can noticeably smooth curves on small source images, at the cost of longer processing time; Off skips this step.</p>
+          <p class="info-pop" id="tip-upscale-factor" role="tooltip" hidden>Bilinear-interpolates the source's continuous grayscale at 2× resolution and thresholds it there, instead of thresholding first and smoothing the binary mask afterward — this preserves true sub-pixel edge position for smoother, more accurate curves. Capped at 2× (higher factors aren't supported); very large images that would exceed the size limit automatically fall back to tracing at native resolution instead. Off skips this step.</p>
+          <p class="advisory-note" id="supersample-advisory" aria-live="polite" hidden></p>
         </div>
         <div class="ctrl-row ctrl-row-select" style="margin-top:4px">
           <div class="ctrl-label-row">
@@ -175,7 +174,7 @@
           </select>
           <p class="info-pop" id="tip-invert" role="tooltip" hidden>Chooses which pixels count as the logo versus the background. Auto-detect guesses this from the image's overall brightness; use Normal for a dark logo on a light background, or Inverted for a light logo on a dark background.</p>
         </div>
-        <p class="ctrl-note">The new pipeline cleans the bitmap first, then traces cleaner silhouettes with fewer, smoother paths. Upscaling runs an edge-preserving Scale2x/3x pass on the cleaned mask before tracing for smoother curves, then scales the result back down to the source size.</p>
+        <p class="ctrl-note">The new pipeline cleans the bitmap first, then traces cleaner silhouettes with fewer, smoother paths. 2× supersampling bilinear-interpolates the source at double resolution before thresholding for smoother sub-pixel edges, then traces at that resolution and scales the result back down to the source size; very large images fall back to tracing at native resolution automatically.</p>
       </div>
     </div>
 

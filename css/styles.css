@@ -516,6 +516,15 @@ input[type=color]{
 }
 #status.ok{color:var(--accent);}
 #status.err{color:var(--danger);}
+#status.warn{color:var(--blue);}
+
+.advisory-note{
+  margin-top:4px;
+  font-size:10px;
+  line-height:1.5;
+  color:var(--blue);
+}
+.advisory-note[hidden]{display:none;}
 
 /* ── RIGHT PANEL ── */
 .right-panel{
