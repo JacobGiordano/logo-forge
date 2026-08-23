@@ -166,3 +166,105 @@ A follow-up issue, if this is picked back up, should scope at minimum:
 ### Test-suite note
 
 No `js/`/`css`/`index.html` changes were made this session, so there is nothing for the Playwright suite to regress. `npm test` was not run as a gate for that reason. It also could not have been run cleanly in isolation against this worktree this session regardless: this worktree's dev server was intentionally started on port 4322 (not the default 4321) since another concurrently-running worktree (issue #29, `/workspace`, primary checkout) legitimately holds 4321 for its own in-progress `js/app.js`/`css/styles.css` changes (confirmed via `diff -rq` against that worktree — its `js/`/`css/` differ from this branch's, i.e. real uncommitted WIP, not a stale process) — exactly the kind of port collision `_system/SOP.md`'s parallel-worktree guidance anticipates. This worktree's `tests/*.spec.ts` files hardcode `http://localhost:4321` in `page.goto` rather than reading Playwright's configurable `baseURL`, so a config override to point at 4322 wasn't sufficient to route around the conflict without either editing test files (outside this agent's ownership) or waiting for port 4321 to free up. The new spike harnesses in this section did exercise the real production code path repeatedly against this worktree's own server on 4322 (`uploadAndTrace()`: real file upload → `#trace-btn` click → potrace-wasm engine → "Done" status, the same flow `tests/potrace.spec.ts` etc. drive) with no errors, but that's not a substitute for the official suite. Recommend Coda sequence a full `npm test` run against this worktree once port 4321 is free, though since no code changed, there's no expected outcome other than confirming the pre-existing baseline still holds.
+
+---
+
+## Issue #32: perf-fix investigation (2026-08-23)
+
+Status: **partial fix found, still not ready to wire in.** #30 identified the blocker as despeckle/hole-fill's flood-fill passes running at the upsampled mask resolution, and asked whether it's fixable via (1) a Web Worker, (2) a capped/clamped effective supersample factor, or (3) a cheaper despeckle algorithm at high resolution. All three were built and measured against the same real-image test set and the same production-scale native sizes #30 used (512 through 4200, factors 2x/4x — including the two cells that OOM-crashed the tab in #30: 4200x4200 @ both factors). Direction 3 (cheap despeckle) is the strongest result — it fixes the specific mechanism #30 pinpointed, gives a real 1.8-7x speedup, and survives one of the two previously-crashing cells outright — but does not fix the *other* large allocation in the pipeline (the bilinear upsample's own float buffer), so 4200x4200@4x still fails, just gracefully instead of catastrophically. No `js/`, `css/`, or `index.html` changes were made — `git diff --stat` on this branch touches only `_system/potrace-spike/` (three new harnesses) and this findings doc.
+
+### Environment caveat (read this before the numbers below)
+
+This session's sandbox has ~7.7GB total system memory with only ~1.9-2.4GB free/available at the time of testing (`free -h`, `/proc/meminfo`) — a materially tighter ceiling than a typical user's desktop browser, which usually has multiple GB of uncontended headroom for a single tab. This matters for two reasons found empirically this session (not assumed):
+
+1. **Absolute crash/success boundaries are lower here than a real user would likely see.** Treat the specific numbers below as a pessimistic lower bound on what's safe, not a precise prediction of a real user's experience.
+2. **Outcomes near the memory ceiling are order-dependent and flaky even within this one session**, which is itself a finding worth taking seriously: a controlled re-run of main-thread bilinear-presupersample at 4200x4200@2x (`profile-worker-control.mjs`) *succeeded* (3208ms) on a fresh page — a cell #30 recorded as an outright crash — while 3000x3000@4x, a cell #30 measured at a clean 8891ms with zero issues, *crashed the page* in that same control run's third cell, and later *hung for 40+ seconds before being force-killed* in a completely fresh browser process during this session's cheap-despeckle perf run (`compare-cheap-despeckle.mjs`). Same code, same inputs, three different outcomes (crash / success / hang) across three attempts in the same session. This is strong evidence that bilinear-presupersample's memory behavior sits right at a cliff edge where small differences in ambient memory pressure decide crash-vs-succeed — which is itself an argument against shipping it without a real fix, independent of which specific fix is chosen.
+
+### Direction 1: Web Worker offload — contains the failure sometimes, doesn't eliminate the ceiling
+
+New harness: `_system/potrace-spike/profile-perf-fix-candidates.mjs` (Part A), control: `_system/potrace-spike/profile-worker-control.mjs`. The whole bilinear-upsample + despeckle/hole-fill pipeline (factor²-scaled thresholds, matching #30's validated composition) was moved into a dedicated Worker via `new Worker(blobUrl)`, with the source luminance array built on the main thread (matching how canvas `getImageData` has to work today — no `OffscreenCanvas` change tested, that's a separate, larger architectural change) and the transferable `Float64Array`/mask handed across via `postMessage(..., [buffer])`.
+
+| native size | factor | Worker offload | outcome |
+|---|---|---|---|
+| 512-3000 | 2x, 4x | 91ms – 6777ms | all succeeded |
+| 4200x4200 | 2x | 3219ms | **succeeded** (crashed in #30) |
+| 4200x4200 | 4x | 199.5ms | **`worker-reported-error: "Array buffer allocation failed"` — a catchable error, not a tab crash** |
+
+Taken alone this looks like a clean win. The control test (same pipeline, main thread, no Worker, but with a **fresh page per cell** — #30's original harness reused one page across its whole sweep) complicates that reading:
+
+| cell | Worker (this session) | main thread + fresh page (control) |
+|---|---|---|
+| 4200x4200 @ 2x | success, 3219ms | success, 3208ms |
+| 4200x4200 @ 4x | catchable error, 199.5ms | **same catchable error**, 8.7ms |
+| 3000x3000 @ 4x | success, 6777.5ms | **page crashed** |
+
+The 4200@4x catchable-failure behavior is **not unique to the Worker** — a fresh main-thread page produces the identical `Array buffer allocation failed` exception, catchable with a normal `try`/`catch`, no Worker required. That specific allocation (a `Float64Array` pair at 16800x16800, ~2.25GB each) simply exceeds what Chromium's ArrayBuffer allocator will grant in this environment regardless of which thread asks — moving it to a Worker doesn't change the ceiling, since dedicated Workers share the same renderer process and address space as their page in Chromium. Where the Worker *did* show a real, reproducible difference is 3000x3000@4x: a cell #30 measured as safely fast (504ms in the *old* Scale2x path, 8891ms for the full bilinear candidate) crashed the page on a fresh main-thread run, but succeeded in the Worker. Given the "environment caveat" section above, some of that divergence is plausibly ambient-memory-pressure noise rather than a Worker-specific effect — but a Worker-isolate crash is, in principle, more containable than a main-thread renderer crash (the isolate can be torn down and the page can catch `worker.onerror` and fall back, vs. a main-thread `OutOfMemoryError` typically taking the whole tab down), and this session's data doesn't contradict that. **Net: a Worker is worth keeping in any real implementation for the UI-responsiveness win alone (despeckle/hole-fill no longer blocks the main thread, matching #32's ask), and it plausibly buys a little extra headroom/containment at the margin — but it does not fix the fundamental memory ceiling.** A single allocation big enough to exceed the browser's ArrayBuffer limit fails the same way whether it's requested from the main thread or a Worker.
+
+### Direction 2: capped effective supersample factor — safe, but the cap eats the whole benefit at exactly the sizes that matter
+
+Same harness, Part B. Instead of a fixed requested factor, `effectiveFactor = min(requestedFactor, outputCap / nativeSize)` — the upsampled output resolution is clamped to a fixed pixel-dimension ceiling regardless of native size or requested factor. Two ceilings tested, full 512-4200 x 2x/4x grid:
+
+| native size | requested | cap=2048 effFactor | cap=2048 time | cap=4096 effFactor | cap=4096 time |
+|---|---|---|---|---|---|
+| 512 | 2x/4x | 2 / 4 | 59-209ms | 2 / 4 | 59-205ms |
+| 1024 | 2x/4x | 2 / 2 | 204-207ms | 2 / 4 | 160-682ms |
+| 2048 | 2x/4x | 1 / 1 | 188-201ms | 2 / 2 | 634-609ms |
+| 3000 | 2x/4x | 0.683 / 0.683 | 174-178ms | 1.365 / 1.365 | 707-764ms |
+| 4200 | 2x/4x | 0.488 / 0.488 | 173-289ms | 0.975 / 0.975 | 712-720ms |
+
+Every cell at both caps succeeds quickly (all under 800ms, vs. 4546-8891ms or an outright crash for the uncapped candidate at comparable sizes in #30). But look at the `effFactor` column: at cap=4096 — the more generous of the two — a native 4200x4200 upload gets an effective factor of **0.975**, i.e. the bilinear step is not supersampling at all, it's *downsampling by a hair*. At cap=2048, anything at or above native 2048 collapses to effFactor ≤1. The two native sizes #30 specifically flagged as the realistic-upload risk (3000, 4200) are exactly the sizes where the cap forces the effective factor below 1 — meaning bilinear-presupersample's entire quality win (validated in #27/#30 at factor ≥2) evaporates precisely where the memory risk was highest. A cap makes this mechanism *safe* but not *useful* at the sizes that motivated #30's real-image testing in the first place; it would only add value for uploads roughly ≤1024-2048px, where the uncapped path was never in danger of crashing anyway (2048@4x was 4546ms uncapped — slow, not a crash). **Net: capping is a valid safety net, not a fix — worth keeping as a hard ceiling underneath whichever other mechanism is chosen (defense in depth), but not sufficient on its own to make bilinear-presupersample deliver its quality win at realistic upload sizes.**
+
+### Direction 3: cheap block-approximate despeckle — fixes the identified root cause, doesn't fix the other one
+
+New harness: `_system/potrace-spike/compare-cheap-despeckle.mjs`. #30 pinpointed despeckle/hole-fill's flood-fill as the dominant cost because `removeSmallComponents`/`fillSmallHoles` each allocate a `visited` `Uint8Array` **and** an `Int32Array` BFS queue at the full upsampled resolution — at 4200x4200@4x (16800x16800, ~282M px) that queue alone is ~1.1GB, on top of the mask, allocated twice (despeckle, then hole-fill). This candidate never allocates a BFS buffer at the upsampled resolution at all:
+
+1. Downsample the fine (upsampled+thresholded) mask back to **native** resolution via majority vote per `factor × factor` block.
+2. Run the exact same `removeSmallComponents`/`fillSmallHoles` (copied verbatim from `js/app.js`) on this small native-resolution mask, with native-unit `maxArea` (no factor² scaling needed — this step never leaves native resolution, so it's the same cost profile as today's shipped pipeline).
+3. Apply the native-resolution flip *decisions* back onto the fine mask: only blocks whose coarse vote changed get flattened to the new value; untouched blocks keep their bilinear-derived sub-pixel edge exactly as-is.
+
+**Perf** (full grid, `full` = #30's validated high-res-despeckle composition, `cheap` = this candidate; `full` skipped at native 4200 rather than re-attempted, since #30 already established it OOM-crashes there and this session's own attempt at 3000x3000@4x `full` hung for 40s and had to be force-killed, confirming it's not worth re-running for no new information):
+
+| native size | factor | full totalMs | cheap totalMs | speedup |
+|---|---|---|---|---|
+| 512 | 2x | 96.2ms | 30.6ms | 3.1x |
+| 512 | 4x | 390.9ms | 54.8ms | 7.1x |
+| 1024 | 2x | 171.6ms | 94.6ms | 1.8x |
+| 1024 | 4x | 704ms | 174.2ms | 4.0x |
+| 2048 | 2x | 566.2ms | 266.3ms | 2.1x |
+| 2048 | 4x | 3114.3ms | 753.8ms | 4.1x |
+| 3000 | 2x | 1343.9ms | 587.2ms | 2.3x |
+| 3000 | 4x | **timeout (40s, force-killed)** | 1886.3ms | — |
+| 4200 | 2x | skipped (known OOM, #30) | **1034.3ms — succeeds** | — |
+| 4200 | 4x | skipped (known OOM, #30) | `Array buffer allocation failed` (10ms, catchable) | — |
+
+Cheap despeckle is 1.8-7.1x faster everywhere it was compared directly, and **succeeds at 4200x4200@2x** — one of the two cells #30 recorded as an outright OOM crash. At 4200x4200@4x it still fails, but the failure mode changed: instead of a tab crash or hang, it's the same `Array buffer allocation failed` exception seen in Direction 1, thrown in 10ms. That's the giveaway for *why* it still fails there: cheap despeckle removes the despeckle-stage's own huge buffers, but the bilinear-upsample step's `Float64Array` pair (2.25GB each at 16800x16800) is untouched by this fix and is a separate allocation that hits its own ceiling regardless of what despeckle algorithm runs afterward. This cleanly isolates the pipeline into two independent memory problems #30's single "despeckle dominates" framing had bundled together: despeckle/hole-fill's BFS buffers (fixed by this candidate) and the bilinear upsample's float buffer (not addressed by any of this issue's three directions — would need its own fix, e.g. processing the upsample in tiles/strips instead of one full-image float array, out of scope for what #32 asked to investigate).
+
+**Quality** (same real-image methodology as #30 Part 1 — `noisy-logo`, `aa-wordmark`, JPEG+salt-noise degraded, WORK_SIZE 240, diffed against clean 4x/960px ground truth):
+
+| case | factor | full: diffPct / fragCount | cheap: diffPct / fragCount |
+|---|---|---|---|
+| noisy-logo | 2x | 0.192% / 0 | 0.192% / 0 (bit-identical) |
+| noisy-logo | 4x | 0.185% / 0 | 0.185% / 0 (bit-identical) |
+| aa-wordmark | 2x | 0.762% / 0 | 0.760% / **1** |
+| aa-wordmark | 4x | 0.707% / 0 | 0.711% / **3** |
+
+`noisy-logo` is bit-identical between `full` and `cheap` — the block-vote decisions matched pixel-perfect BFS exactly. `aa-wordmark` (font anti-aliasing, more small/thin features than the star shape) is where the approximation shows: diffPct is statistically unchanged (≤0.005 percentage points either direction — not a real fidelity loss), but `cheap` introduces 1-3 small stray fragment paths that `full`'s exact per-pixel BFS didn't have (pathCount 9-11 vs a clean 8). This is the predicted failure mode of majority-vote downsampling: a speck or thin feature straddling a native-pixel block boundary can fail to trigger the majority vote in either adjacent block, surviving as an untouched sliver. It is a real, non-zero regression from #30's "0% fragmentation at every factor/case" result — but it is nowhere near #12's/#25's 86-99.6% fragmentation catastrophe; it's 1-3 extra tiny paths on an otherwise-correct 8-path topology, not a structural breakdown. Whether that's acceptable would depend on tuning the majority-vote threshold (currently a flat 50%, e.g. a stricter "any foreground pixel in the block counts as foreground" rule for despeckle's removal side would likely close this gap at some cost to despeckle strength) — not explored this session, flagged as follow-up work.
+
+### Recommendation
+
+Direction 3 (cheap block-approximate despeckle) is the one worth pursuing further — it's the only candidate that reduces the actual memory footprint rather than relocating or capping around it, it delivers a real and substantial speedup (1.8-7.1x) everywhere, and it recovers one of #30's two crash cells outright (4200x4200@2x) with a small, quantified, non-catastrophic quality cost on one of two real-image test cases. It should be **combined with Direction 1** (Worker offload, for the UI-responsiveness win #32 explicitly asked about and the plausible-but-unproven extra isolation margin) and **Direction 2** (a hard output-resolution cap as a defense-in-depth safety net, sized generously enough — e.g. above 4096 — that it doesn't neuter the quality win at the native sizes that matter, but still exists as a backstop). None of the three, alone or combined, fixes the bilinear-upsample step's own float-buffer allocation at native 4200 @ factor 4 — that remains a hard failure (now gracefully caught rather than a crash/hang, which is itself real progress) and would need a fourth, unexplored mechanism (tiled/strip processing of the upsample step) to close entirely.
+
+**This is exactly the "numbers look concerning, loop in Tempo" case #30 flagged and #32 was scoped around.** Recommend Coda route this to Tempo before any implementation attempt, specifically to weigh in on:
+- Whether the environment caveat above (flaky crash/success/hang outcomes for the *same* cell across repeated attempts, even in this one investigation session) is disqualifying on its own, independent of which fix is chosen — a mechanism whose failure mode is nondeterministic under memory pressure is a harder thing to gate safely than one with a clean, reproducible threshold.
+- Whether the majority-vote threshold in Direction 3's `cheapDespeckle` (currently a flat "≥50% of the block is foreground") should be tuned/asymmetric between despeckle and hole-fill to close the `aa-wordmark` fragmentation gap before this is considered production-ready.
+- Whether a tiled/strip bilinear-upsample (never explored this session, needed to fix the still-unsolved 4200@4x float-buffer ceiling) is worth scoping as connected follow-up work, or whether a Direction-2-style cap at that specific boundary (i.e., cap the *bilinear step's own* input, not just the despeckle stage) is an acceptable stopgap.
+
+### What's kept vs. cleaned up
+
+- Kept: `_system/potrace-spike/profile-perf-fix-candidates.mjs` (Worker offload + capped-factor grid), `_system/potrace-spike/profile-worker-control.mjs` (main-thread/fresh-page control for the Worker comparison), `_system/potrace-spike/compare-cheap-despeckle.mjs` (block-approx despeckle perf + quality harness) — all reusable for whoever scopes a real implementation issue.
+- Not committed: `_system/potrace-spike/out-32-perf/`, `_system/potrace-spike/out-32-cheap-despeckle/` (generated JSON/PNGs, gitignored via the existing `out-*/` pattern — regenerate via the commands in each script's header comment).
+- `js/app.js`, `js/imagetracer.js`, `js/potrace-trace.js`, `js/upscale.js`, `css/` — untouched. No app code was modified for this spike; all three candidate mechanisms exist only inside the three harnesses' `page.evaluate`/Worker blocks, run against direct potrace-wasm/synthetic-canvas calls, matching #27/#30's established pattern. No toggle, no Worker file, and no size cap was added to the live app.
+
+### Prior art check (CLAUDE.md requirement)
+
+Ran `git log --oneline --all --grep="worker" --grep="Worker" --grep="capped" --grep="cap " --grep="despeckle" --grep="perf" -i` before finalizing. No prior attempt at any of the three directions exists; the only hits are #30's own findings commit, #26's tooltip work (unrelated "cap" false-positive), #19's Otsu clamp fix, #18's selection-UI tests, #4's original Scale2x upscaler (already the baseline #27/#30 compare against), and an unrelated mobile-layout fix — none overlap with Worker offload, capped supersample resolution, or block-approximate despeckle.
