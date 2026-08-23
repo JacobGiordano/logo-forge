@@ -19,30 +19,49 @@ let liveEnabled = true;
 let liveTimer = null;
 
 // ── Bilinear-presupersample (issue #34) ─────────────────────────────────
+// Native-resolution safety gate, checked FIRST (ahead of BILINEAR_OUTPUT_CAP
+// below), added after this issue's own manual verification found a
+// reproducible (3/3), non-catchable, full renderer-process crash at
+// 4200x4200 native @ 2x — a size #32's isolated spike harness had recorded
+// as safe. Tempo's read after reviewing this finding: the isolated harnesses
+// undercounted real memory pressure, since the actual app concurrently holds
+// the source image, thumbnail canvas, potrace-wasm's own heap, and
+// undo/selection state on top of the bilinear pipeline's own buffers — a
+// structural gap between spike and production, not sandbox noise. A full
+// process crash can't be caught by worker.onerror/try-catch (the condition-2
+// fallback below only covers the catchable ArrayBuffer-allocation-failure
+// path), so this has to be a hard gate, not a try/catch. 3000 was chosen as
+// the conservative default: it's the largest native size anywhere in
+// #30/#32/this issue's data with zero recorded crash at ANY factor, and 4200
+// is the smallest size with a reproducible one — the true boundary is
+// unmeasured between those two points. At/above this size, bilinear-
+// presupersample is not attempted at all; the pipeline goes straight to the
+// legacy fallback (native Otsu + despeckle/hole-fill + Scale2x-2x), same
+// path condition 2's catchable-error handling already uses.
+const BILINEAR_NATIVE_SAFE_LIMIT = 3000;
 // Backstop cap on the bilinear-presupersample mechanism's OUTPUT resolution
-// (native longest dimension × 2), independent of the per-attempt Worker
-// try/catch below — defense-in-depth for pathological native sizes beyond
-// the tested 512-4200px range. Above this, bilinear-presupersample isn't
-// attempted at all and the pipeline falls straight back to tracing at
-// native resolution (see preprocessImageData). Reasoning for 10,000
-// specifically: max validated combo is 4200×2=8400px output (see
+// (native longest dimension × 2), independent of BILINEAR_NATIVE_SAFE_LIMIT
+// above and of the per-attempt Worker try/catch below — defense-in-depth for
+// pathological native sizes beyond the tested 512-4200px range, and kept as
+// an independent second guard in case BILINEAR_NATIVE_SAFE_LIMIT is ever
+// raised later without fresh measurement. Above this, bilinear-
+// presupersample isn't attempted at all and the pipeline falls straight
+// back to tracing at native resolution (see preprocessImageData). Reasoning
+// for 10,000 specifically: max validated combo is 4200×2=8400px output (see
 // _system/bilinear-presupersample-tracing-findings.md, #32's perf/memory
 // investigation); 10,000 sits ~19% above that with real memory margin below
 // the known ~2.25GB single-buffer failure point. Don't raise this without
 // new measurement; don't lower it below 8400 or it clips the validated
-// range.
+// range. In practice BILINEAR_NATIVE_SAFE_LIMIT above will almost always
+// gate first now (3000×2=6000 < 10000), which is intentional — this cap's
+// job is the untested tail beyond 4200 native, not the 3000-4200+ band.
 const BILINEAR_OUTPUT_CAP = 10000;
-// Pre-trace advisory threshold — once native×2 is within this fraction of
-// the backstop, show a heads-up before the user hits the cap at trace time
-// (see updateSupersampleAdvisory()), rather than only surfacing it as a
-// post-hoc fallback message.
-const BILINEAR_ADVISORY_RATIO = 0.8;
 // Safety timeout for the bilinear-presupersample Worker round-trip — a hang
 // (as opposed to a clean error) should still fall back rather than stall
 // the trace indefinitely. Generous relative to the worst measured real
 // timing in #32's findings (~1.9s at 3000x3000@4x cheap despeckle; this
-// app only ever requests factor 2, and is capped at 5000x5000 native by
-// BILINEAR_OUTPUT_CAP above, so this margin is large.
+// app only ever requests factor 2, and is gated below BILINEAR_NATIVE_SAFE_LIMIT
+// in practice, so this margin is large.
 const BILINEAR_WORKER_TIMEOUT_MS = 20000;
 
 const CONTROL_DEFS = [
@@ -430,22 +449,24 @@ function finalizeImage(img, dataUrl) {
   scheduleLive();
 }
 
-// Pre-trace heads-up (issue #34, Tempo's advisory recommendation): warns
-// the user before they trigger the bilinear-presupersample backstop
-// fallback (BILINEAR_OUTPUT_CAP above), rather than only finding out via
-// the post-trace fallback status message. Shown once native size × 2
-// approaches or exceeds the cap, regardless of the current upscale-factor
-// selection (the control can be changed after upload without a new file
-// load event, so this can't be gated on the dropdown's value at call time).
+// Pre-trace heads-up (issue #34, Tempo's advisory recommendation): informs
+// the user, ahead of time, that 2× will use the legacy Scale2x fallback
+// instead of bilinear-presupersample — rather than only finding out via the
+// post-trace fallback status message. This is informational only, never a
+// dialog/opt-in the user could click through into the crash-prone path (see
+// BILINEAR_NATIVE_SAFE_LIMIT's comment) — the gate below is unconditional
+// regardless of whether this note is read. Shown once native size reaches
+// either threshold, regardless of the current upscale-factor selection (the
+// control can be changed after upload without a new file load event, so
+// this can't be gated on the dropdown's value at call time).
 function updateSupersampleAdvisory(longestNativeDim) {
   const el = document.getElementById('supersample-advisory');
   if (!el) return;
-  const outputAtFactor2 = longestNativeDim * 2;
-  if (outputAtFactor2 > BILINEAR_OUTPUT_CAP) {
-    el.textContent = 'This image is too large for 2× supersampling (output would exceed ~' + BILINEAR_OUTPUT_CAP.toLocaleString() + 'px) — 2× will trace at native resolution instead.';
-    el.hidden = false;
-  } else if (outputAtFactor2 > BILINEAR_OUTPUT_CAP * BILINEAR_ADVISORY_RATIO) {
-    el.textContent = 'Heads up: this image is close to the 2× supersampling size limit (~' + BILINEAR_OUTPUT_CAP.toLocaleString() + 'px output) — tracing may fall back to native resolution.';
+  if (longestNativeDim >= BILINEAR_NATIVE_SAFE_LIMIT) {
+    const outputAtFactor2 = longestNativeDim * 2;
+    el.textContent = outputAtFactor2 > BILINEAR_OUTPUT_CAP
+      ? 'This image is too large for 2× supersampling (output would exceed ~' + BILINEAR_OUTPUT_CAP.toLocaleString() + 'px) — 2× will trace at native resolution instead.'
+      : 'This image is large — 2× will automatically use standard (Scale2x) supersampling instead of bilinear.';
     el.hidden = false;
   } else {
     el.hidden = true;
@@ -1525,9 +1546,20 @@ async function preprocessImageData(imgData, settings, invert) {
   let fallbackMessage = null;
 
   if (wantsBilinear) {
-    const outputLongest = Math.max(width, height) * 2;
-    if (outputLongest > BILINEAR_OUTPUT_CAP) {
+    const longestNative = Math.max(width, height);
+    const outputLongest = longestNative * 2;
+    if (longestNative >= BILINEAR_NATIVE_SAFE_LIMIT) {
+      // Hard, unconditional gate — checked BEFORE the backstop cap below,
+      // and never attempted/try-caught. A native size at or above this
+      // limit skips bilinear-presupersample entirely rather than risking
+      // the full renderer-process crash this issue's manual verification
+      // reproduced 3/3 at 4200 native — see BILINEAR_NATIVE_SAFE_LIMIT's
+      // comment for why this can't be a try/catch like the branch below.
+      fallbackMessage = 'Large image — using standard supersampling instead of 2× bilinear.';
+    } else if (outputLongest > BILINEAR_OUTPUT_CAP) {
       // Backstop cap, defense-in-depth — see BILINEAR_OUTPUT_CAP's comment.
+      // In practice unreachable while BILINEAR_NATIVE_SAFE_LIMIT stays at
+      // 3000 (3000×2=6000 < 10000); kept as an independent second guard.
       fallbackMessage = 'Image too large for 2× supersampling — traced at native resolution instead.';
     } else {
       try {
