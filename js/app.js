@@ -71,6 +71,7 @@ function applySettings(settings) {
   document.getElementById('upscale-factor').value = settings.upscaleFactor;
   document.getElementById('invert').value = settings.invert;
   syncControlBadges();
+  syncThresholdControlsDisabled();
 }
 
 function applySnapshot(snap) {
@@ -151,6 +152,21 @@ function syncControlBadges() {
   });
 }
 
+// `threshold` (manual-only) and `threshold-bias` (auto-only) each have no
+// effect outside their one mode (see #26 tooltip copy). Disable+dim the
+// inactive one — both the range input and its paired .val-input number
+// field — rather than hiding it, so the relationship stays discoverable
+// without a layout reflow on every mode toggle (#29). Applied at init below
+// and again from the threshold-mode 'input' listener in the CONTROL_DEFS
+// loop, not a separate listener.
+function syncThresholdControlsDisabled() {
+  const manualActive = document.getElementById('threshold-mode').value === 'manual';
+  document.getElementById('threshold').disabled = !manualActive;
+  document.getElementById('v-threshold').disabled = !manualActive;
+  document.getElementById('threshold-bias').disabled = manualActive;
+  document.getElementById('v-threshold-bias').disabled = manualActive;
+}
+
 function clampToSlider(rawValue, slider) {
   const min = slider.min === '' ? -Infinity : parseFloat(slider.min);
   const max = slider.max === '' ? Infinity : parseFloat(slider.max);
@@ -186,6 +202,7 @@ CONTROL_DEFS.forEach(({ id, valueId, decimals }) => {
     if (valueId) {
       document.getElementById(valueId).value = parseFloat(el.value).toFixed(decimals);
     }
+    if (id === 'threshold-mode') syncThresholdControlsDisabled();
     scheduleLive();
   });
   el.addEventListener('change', scheduleLive);
@@ -206,6 +223,10 @@ CONTROL_DEFS.forEach(({ id, valueId, decimals }) => {
     });
   }
 });
+
+// Apply the initial disabled/dimmed state for whatever threshold-mode
+// defaults to on page load — not just on subsequent changes (#29).
+syncThresholdControlsDisabled();
 
 // ── Slider/setting info popovers (#26) ───────────────────────────────────
 // Click/tap-to-toggle is the one interaction guaranteed to work everywhere
