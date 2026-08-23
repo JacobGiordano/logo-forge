@@ -262,14 +262,31 @@ CONTROL_DEFS.forEach(({ id, valueId, decimals }) => {
     });
 
     if (!touch) {
-      // Hover target is the whole row, not just the 14px button — the
-      // popover itself renders below the slider (grid-area "info"), so
-      // binding hover to the button alone would fire mouseleave the
-      // instant the cursor moves down off the button toward the text,
-      // closing the tip before it could be read.
-      const row = item.btn.closest('.ctrl-row') || item.btn.parentElement;
-      row.addEventListener('mouseenter', () => { item.hovering = true; render(item); });
-      row.addEventListener('mouseleave', () => { item.hovering = false; render(item); });
+      // Hover target is just the button and its own popover — NOT the
+      // whole row, which would also fire on hovering/dragging the
+      // slider/number input (#28). The popover renders below the slider
+      // (grid-area "info"), so the cursor crosses unclaimed slider
+      // territory on its way from the button down to the popover text;
+      // a short grace delay on mouseleave (cancelled if the cursor lands
+      // on either target before it elapses) keeps the tip open long
+      // enough to survive that trip without reopening on slider hover.
+      let hideTimer = null;
+      const show = () => {
+        clearTimeout(hideTimer);
+        item.hovering = true;
+        render(item);
+      };
+      const scheduleHide = () => {
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(() => {
+          item.hovering = false;
+          render(item);
+        }, 200);
+      };
+      item.btn.addEventListener('mouseenter', show);
+      item.btn.addEventListener('mouseleave', scheduleHide);
+      item.pop.addEventListener('mouseenter', show);
+      item.pop.addEventListener('mouseleave', scheduleHide);
     }
   });
 
