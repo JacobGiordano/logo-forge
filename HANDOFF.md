@@ -1,23 +1,20 @@
-Last updated: 2026-08-23
+Last updated: 2026-08-24
 
 ## Status
 
-Issues #11-#31 complete and merged to main, shipped. Every trace-setting slider now has an explanatory tap/click (+ hover-on-desktop) popover; the threshold/threshold-bias sliders now disable+dim based on the selected threshold mode instead of both always being interactable. Two tracing-pipeline spikes ran this cycle: multi-level/antialiased pre-binarize tracing (#25) was ruled out; bilinear-presupersample pre-binarize tracing (#27) won on quality/fragment-count but failed perf profiling at production upload sizes (#30) — not wired into production, findings only.
+Issues #11-#31 complete and previously shipped. This cycle: #32 (perf spike) found and validated a fix for the bilinear-presupersample OOM/crash blocker from #30, and #34 wired bilinear-presupersample into production — pre-threshold bilinear supersampling replaces the Scale2x-family upscale's 2x tier, hard-capped at 2x (3x/4x never exposed). Two same-day follow-ups tightened the safety gate after manual verification surfaced crashes the isolated spike harnesses didn't catch. Tempo reviewed the final gate. Full Playwright suite (33 tests) green.
 
 ## Decisions made this session
 
-- #26/#28: slider tooltips are click/tap-to-pin everywhere (guaranteed via native `<button>` click semantics) plus a hover preview on desktop only, gated on `isTouchPrimary()`. Hover must bind to just the info button + its own popover, NOT the whole `.ctrl-row` (#28 regression) — a `.ctrl-row`-wide hover binding also fires on hovering/dragging the slider itself. Fixed with a 200ms grace-period timer on mouseleave so the tip survives the cursor's trip from button down to popover text (separate grid row) without needing row-wide capture.
-- #29: `threshold` (Manual-only) and `threshold-bias` (Auto-only) sliders + their number inputs now disable+dim based on `threshold-mode`, both on change and on initial load. Chose disable-and-dim over hide to avoid layout reflow on every mode toggle and keep the relationship discoverable. `applySettings()` (undo/redo path) also re-syncs this, since it sets `threshold-mode.value` directly without firing an `input` event.
-- #31: fallout from #29 — `tests/undo-redo.spec.ts` was filling `#threshold` while it sat disabled in default Auto mode. Fixed by switching to Manual mode before each fill at all 4 call sites.
-- #25 (spike): multi-level/antialiased pre-binarize tracing measured worse than the current pipeline on every axis (2-3x worse pixel-diff, reproduced #12's speckle-fragment problem even on clean synthetic shapes). Ruled out, no follow-up.
-- #27/#30 (spike + productionization attempt): bilinear-interpolating grayscale before Otsu threshold (vs. today's Scale2x-after-binarize) beats the current pipeline on quality (better fidelity, smaller output, zero fragments) and the win holds on real degraded/anti-aliased images, not just synthetic shapes (#30). But it's 3-17x slower and OOM-crashed the tab at a realistic upload size (4200x4200) — dominant cost is despeckle/hole-fill's flood-fill passes at the upsampled resolution, not the bilinear resample itself. Composition finding: despeckle/hole-fill would need to move to run after threshold at the upsampled resolution with factor²-scaled `maxArea` (area scales quadratically, not linearly) — validated on the quality tests, but moot until perf is solved. Not wired into production. A future attempt needs a perf fix (Web Worker, capped upload size, or a cheaper despeckle pass at high resolution) before revisiting productionization — loop in Tempo first. Findings: `_system/bilinear-presupersample-tracing-findings.md`.
+- #32: root cause of #30's OOM was despeckle/hole-fill's flood-fill running at upsampled mask resolution, not the bilinear resample itself. Fix: cheap block-approximate despeckle (downsample to native via majority vote, run existing despeckle at native cost, apply flip decisions back onto the fine mask) — recovers the 2x crash cell at every tested size (512-4200). 4x remained unrecoverable (separate bottleneck: the bilinear upsample's own Float64Array pair scales with (native × factor)², ~4.5GB at 4x/4200px) — this is why #34 capped the mechanism to 2x rather than fixing 4x.
+- #34: implemented per issue — `js/bilinear-worker.js` (new) runs the bilinear upsample + cheap despeckle off the main thread, with clean rejection on construction/postMessage/runtime failure and a 20s timeout. `preprocessImageData` in `js/app.js` is now async.
+- #34 follow-ups (same-day manual verification, not in the original spike harnesses): production holds the source image, thumbnail canvas, potrace-wasm's heap, and undo/selection state concurrently on top of the bilinear buffers, so real crash thresholds are lower than the isolated harnesses measured. A full renderer-process crash can't be caught by try/catch or worker.onerror. Also found the Scale2x-2x *fallback* crashes at the same native sizes (~4037-4200px) as bilinear-2x — the danger zone is producing/tracing a large mask at all, independent of which algorithm made it. Resolved with one unified gate: `BILINEAR_NATIVE_SAFE_LIMIT = 3500` (native longest dimension) — at/above this, neither bilinear-2x nor its Scale2x-2x fallback is attempted; the pipeline runs at native resolution with no upscale. This supersedes the earlier `BILINEAR_OUTPUT_CAP` (10,000px) backstop.
 
 ## Next issues
 
-- Color-aware tracing: on hold per user request until color capabilities come up again; still needs a despeckle-focused spike first if revisited (see #12 findings).
+- #33 (Scout): Playwright coverage for the #26/#28 tooltip/popover feature — not started, still open.
+- Color-aware tracing: on hold per user request until color capabilities come up again.
 - Possible future: `touchcancel` handling for pinch/pan if an interrupted OS gesture ever turns out to be a real-world pain point (flagged in #23, not urgent).
-- No open issues right now on the bilinear-presupersample line — needs a perf-focused spike (Tempo) before any further productionization attempt, not scoped yet.
-- Scout flagged: no Playwright coverage exists yet for the #26 tooltip feature (hover/click/tap/escape/dismiss) — not scoped as an issue yet.
 
 ## Gotchas
 
@@ -26,7 +23,6 @@ Issues #11-#31 complete and merged to main, shipped. Every trace-setting slider 
 - Selection UI only appears for images >256px in the relevant dimension; smaller images skip straight to tracing
 - `body{height:100vh}` on desktop is load-bearing for the sidebar's internal scroll; the mobile media query overrides it back to `auto` — don't remove either half independently
 - Live-update debounce is 350ms (`scheduleLive()` in `js/app.js`); all trace triggers must go through `#trace-btn`'s `clearTimeout(liveTimer)` guard
-- `compactPathData()` in `js/app.js` does real RDP node simplification (#24), not just precision rounding — keep curve segments untouched, re-check both engines if you touch it
-- `initInfoPopovers()` in `js/app.js`: hover must stay scoped to `item.btn`/`item.pop` only, never the whole `.ctrl-row` (#28) — see the inline comment for the grace-timer mechanism
 - `#threshold`/`#threshold-bias` are conditionally disabled based on `threshold-mode` (#29) — any test or code path that fills one directly must first ensure the matching mode is selected
+- `preprocessImageData` (`js/app.js`) is async and gated by `BILINEAR_NATIVE_SAFE_LIMIT = 3500` (native longest dimension) — above this, neither bilinear-presupersample nor its Scale2x-2x fallback runs; touching this pipeline needs manual verification at real upload sizes (4000px+), not just the isolated spike harnesses in `_system/potrace-spike/`, which understated production memory pressure
 - Playwright's dev server is hardcoded to port 4321 (`playwright.config.ts`) — a killed/removed worktree can leave an orphaned `serve` process holding it; check `ps aux | grep "serve \."` before assuming the port is broken
