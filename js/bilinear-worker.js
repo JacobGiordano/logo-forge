@@ -141,9 +141,28 @@ function fillSmallHoles(mask, width, height, maxArea) {
 // Direction 3 from issue #32's findings: block-approximate despeckle that
 // never allocates a BFS buffer at the fine (upsampled) resolution. Ported
 // from _system/potrace-spike/compare-cheap-despeckle.mjs's cheapDespeckle().
+//
+// Majority-vote threshold tuned by issue #35: the original flat 50% vote
+// (sum >= half) left a speck/thin feature straddling a native-pixel block
+// boundary invisible to despeckle whenever it fell under 50% in EVERY
+// block it touched -- the coarse view never saw it as foreground, so
+// removeSmallComponents never got a chance to remove it, and its original
+// fine-resolution pixels survived untouched, producing a stray fragment
+// path (1 extra on aa-wordmark at 2x, see findings doc + #35). Requiring
+// ALL factor x factor fine pixels in a block to be foreground (sum ===
+// total) before the block counts as foreground closes this gap: validated
+// via _system/potrace-spike/sweep-despeckle-threshold.mjs against the
+// aa-wordmark/noisy-logo real-image quality set, this exactly matches
+// full-BFS despeckle's path count on aa-wordmark at factor=2 (production's
+// only value -- see the `factor: 2` call in js/app.js) while leaving
+// noisy-logo bit-identical, across every despeckleNative/holeNative
+// pairing tested. This was validated ONLY at factor=2 -- the same sweep
+// found this threshold catastrophic at factor=4 (10x+ more paths), so do
+// NOT reuse this threshold if factor is ever unlocked above 2 without
+// re-running that sweep first.
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
   const coarse = new Uint8Array(w * h);
-  const half = (factor * factor) / 2;
+  const total = factor * factor;
   for (let ny = 0; ny < h; ny++) {
     for (let nx = 0; nx < w; nx++) {
       let sum = 0;
@@ -153,7 +172,7 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
         const row = (fy0 + dy) * ow + fx0;
         for (let dx = 0; dx < factor; dx++) sum += fineMask[row + dx];
       }
-      coarse[ny * w + nx] = sum >= half ? 1 : 0;
+      coarse[ny * w + nx] = sum === total ? 1 : 0;
     }
   }
 

@@ -148,9 +148,15 @@ function fillSmallHoles(mask, width, height, maxArea) {
 // majority vote, clean at native res (cheap), apply flip decisions back to
 // fine res by flattening only CHANGED blocks. No BFS buffer is ever
 // allocated at the fine (upsampled) resolution.
+//
+// Threshold updated by issue #35 (see sweep-despeckle-threshold.mjs and
+// js/bilinear-worker.js's cheapDespeckle for the full rationale): a block
+// counts as foreground only if ALL factor x factor fine pixels in it are
+// foreground (sum === total), not the original flat 50% vote -- validated
+// at factor=2 only, do not reuse at factor=4 without re-sweeping.
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
   const coarse = new Uint8Array(w * h);
-  const half = (factor * factor) / 2;
+  const total = factor * factor;
   for (let ny = 0; ny < h; ny++) {
     for (let nx = 0; nx < w; nx++) {
       let sum = 0;
@@ -159,7 +165,7 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
         const row = (fy0 + dy) * ow + fx0;
         for (let dx = 0; dx < factor; dx++) sum += fineMask[row + dx];
       }
-      coarse[ny * w + nx] = sum >= half ? 1 : 0;
+      coarse[ny * w + nx] = sum === total ? 1 : 0;
     }
   }
   let cleaned = removeSmallComponents(coarse, w, h, despeckleNative);
