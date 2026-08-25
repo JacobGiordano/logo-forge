@@ -73,6 +73,34 @@
     <div class="panel-section">
       <div class="sec-head">Trace</div>
       <div class="ctrl">
+        <div class="ctrl-subhead">Levels</div>
+        <div class="ctrl-row">
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="levels-black">Black point</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-levels-black" aria-label="What does Black point do?">i</button>
+          </div>
+          <input type="range" id="levels-black" min="0" max="255" step="1" value="0">
+          <input type="number" class="val-input" id="v-levels-black" data-slider="levels-black" min="0" max="255" step="1" value="0">
+          <p class="info-pop" id="tip-levels-black" role="tooltip" hidden>Remaps the source image's tones before thresholding — any pixel at or darker than this brightness becomes pure black. Raise it to deepen faded blacks or crush out light scan noise; 0 leaves the darkest source tones untouched.</p>
+        </div>
+        <div class="ctrl-row">
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="levels-white">White point</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-levels-white" aria-label="What does White point do?">i</button>
+          </div>
+          <input type="range" id="levels-white" min="0" max="255" step="1" value="255">
+          <input type="number" class="val-input" id="v-levels-white" data-slider="levels-white" min="0" max="255" step="1" value="255">
+          <p class="info-pop" id="tip-levels-white" role="tooltip" hidden>Remaps the source image's tones before thresholding — any pixel at or brighter than this brightness becomes pure white. Lower it to brighten a dingy or yellowed background; 255 leaves the lightest source tones untouched.</p>
+        </div>
+        <div class="ctrl-row">
+          <div class="ctrl-label-row">
+            <label class="ctrl-label" for="levels-gamma">Gamma</label>
+            <button type="button" class="info-btn" aria-expanded="false" aria-controls="tip-levels-gamma" aria-label="What does Gamma do?">i</button>
+          </div>
+          <input type="range" id="levels-gamma" min="0.1" max="3" step="0.1" value="1">
+          <input type="number" class="val-input" id="v-levels-gamma" data-slider="levels-gamma" min="0.1" max="3" step="0.1" value="1">
+          <p class="info-pop" id="tip-levels-gamma" role="tooltip" hidden>Curves the midtones between the black and white points without moving pure black or pure white. Values above 1 brighten midtones, pulling more into the traced logo; values below 1 darken them; 1.0 leaves the curve linear (off).</p>
+        </div>
         <div class="ctrl-subhead">Binary mask</div>
         <div class="ctrl-row ctrl-row-select">
           <div class="ctrl-label-row">

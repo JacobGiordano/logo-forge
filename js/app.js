@@ -106,6 +106,9 @@ function scaledDespeckleThreshold(despeckleSetting, width, height) {
 }
 
 const CONTROL_DEFS = [
+  { id: 'levels-black', valueId: 'v-levels-black', decimals: 0 },
+  { id: 'levels-white', valueId: 'v-levels-white', decimals: 0 },
+  { id: 'levels-gamma', valueId: 'v-levels-gamma', decimals: 1 },
   { id: 'threshold-mode', valueId: null, decimals: 0 },
   { id: 'threshold', valueId: 'v-threshold', decimals: 0 },
   { id: 'threshold-bias', valueId: 'v-threshold-bias', decimals: 0 },
@@ -133,6 +136,9 @@ function pushHistory(snap) {
 
 function snapshotSettings() {
   return {
+    levelsBlack: document.getElementById('levels-black').value,
+    levelsWhite: document.getElementById('levels-white').value,
+    levelsGamma: document.getElementById('levels-gamma').value,
     thresholdMode: document.getElementById('threshold-mode').value,
     threshold: document.getElementById('threshold').value,
     thresholdBias: document.getElementById('threshold-bias').value,
@@ -147,6 +153,9 @@ function snapshotSettings() {
 }
 
 function applySettings(settings) {
+  document.getElementById('levels-black').value = settings.levelsBlack;
+  document.getElementById('levels-white').value = settings.levelsWhite;
+  document.getElementById('levels-gamma').value = settings.levelsGamma;
   document.getElementById('threshold-mode').value = settings.thresholdMode;
   document.getElementById('threshold').value = settings.threshold;
   document.getElementById('threshold-bias').value = settings.thresholdBias;
@@ -1573,6 +1582,9 @@ function setLoading(on) {
 
 function readSettings() {
   return {
+    levelsBlack: parseInt(document.getElementById('levels-black').value, 10),
+    levelsWhite: parseInt(document.getElementById('levels-white').value, 10),
+    levelsGamma: parseFloat(document.getElementById('levels-gamma').value),
     thresholdMode: document.getElementById('threshold-mode').value,
     threshold: parseInt(document.getElementById('threshold').value, 10),
     thresholdBias: parseInt(document.getElementById('threshold-bias').value, 10),
@@ -1584,6 +1596,36 @@ function readSettings() {
     upscaleFactor: parseInt(document.getElementById('upscale-factor').value, 10),
     invert: document.getElementById('invert').value,
   };
+}
+
+// ── Levels adjustment (issue #40) ────────────────────────────────────────
+// Photoshop-style black point / white point / gamma remap of the source
+// image, applied to the composited luminance value inside
+// preprocessImageData's per-pixel loop below — upstream of everything else
+// in the pipeline (the Otsu histogram, threshold resolution, and the
+// continuous field bilinear-presupersample consumes all see the adjusted
+// tones as if they were the source image's own). Grayscale/luminance only
+// by design — color-aware tracing is on hold (see CLAUDE.md / HANDOFF.md),
+// so this never touches per-channel RGB, only the single composited value
+// buildMask and friends already reduce every pixel to.
+//
+// Operates on the CONTINUOUS (unrounded) luminance value, not the
+// quantized one — rounding first and remapping second would throw away
+// the same sub-pixel precision `luminanceContinuous` exists to preserve
+// (see its own comment below), and would visibly banding-step a gamma
+// curve across a smooth gradient. Standard Levels formula: linearly
+// stretch [blackPoint, whitePoint] to [0,1], clamp, then apply the
+// gamma curve.
+function applyLevels(lum, blackPoint, whitePoint, gamma) {
+  const range = whitePoint - blackPoint;
+  // whitePoint <= blackPoint is a degenerate/inverted state the sliders'
+  // own min/max can't produce independently, but two sliders can still be
+  // dragged past each other — guard against a zero/negative divisor by
+  // treating it as "no adjustment" rather than producing Infinity/NaN.
+  if (range <= 0) return lum;
+  let normalized = (lum - blackPoint) / range;
+  normalized = normalized < 0 ? 0 : normalized > 1 ? 1 : normalized;
+  return (gamma === 1 ? normalized : Math.pow(normalized, 1 / gamma)) * 255;
 }
 
 async function preprocessImageData(imgData, settings, invert) {
@@ -1601,9 +1643,15 @@ async function preprocessImageData(imgData, settings, invert) {
   const luminance = new Uint8Array(width * height);
   const hist = new Uint32Array(256);
 
+  // Fast-path the overwhelmingly common case (defaults: 0/255/1, a no-op
+  // identity remap) so this issue adds no per-pixel cost at all when the
+  // user hasn't touched the Levels controls.
+  const levelsActive = settings.levelsBlack !== 0 || settings.levelsWhite !== 255 || settings.levelsGamma !== 1;
+
   for (let i = 0, px = 0; i < imgData.data.length; i += 4, px++) {
     const alpha = imgData.data[i + 3] / 255;
-    const lum = (imgData.data[i] * 0.299 + imgData.data[i + 1] * 0.587 + imgData.data[i + 2] * 0.114) * alpha + 255 * (1 - alpha);
+    let lum = (imgData.data[i] * 0.299 + imgData.data[i + 1] * 0.587 + imgData.data[i + 2] * 0.114) * alpha + 255 * (1 - alpha);
+    if (levelsActive) lum = applyLevels(lum, settings.levelsBlack, settings.levelsWhite, settings.levelsGamma);
     luminanceContinuous[px] = lum;
     const rounded = Math.max(0, Math.min(255, Math.round(lum)));
     luminance[px] = rounded;
