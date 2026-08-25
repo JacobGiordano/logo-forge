@@ -278,9 +278,11 @@ function labelComponents(mask, width, height) {
 // stays IDENTICAL to the pre-#35 baseline at factor=4 (no factor=4
 // landmine) — AND, unlike the size-only version, leaves the small-dot-core
 // case's interior core untouched (matches baseline-50pct's path count
-// exactly), while the size-only version measurably carves the hole
-// (+1 path vs. baseline) on that same case. Do not raise SPUR_AREA_CAP or
-// drop the boundary-adjacency gate without re-running that sweep.
+// exactly) at spurArea=4 (production's SPUR_AREA_CAP, exercised directly —
+// the fixture's core area is 1 block, comfortably inside the cap), while
+// the size-only version measurably carves the hole (+1 path vs. baseline)
+// at that same spurArea=4. Do not raise SPUR_AREA_CAP or drop the
+// boundary-adjacency gate without re-running that sweep.
 const SPUR_AREA_CAP = 4;
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
   const coarseStd = new Uint8Array(w * h);

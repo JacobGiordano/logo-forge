@@ -586,7 +586,14 @@ async function coreHoleCheck(page, factor, variant, despeckleNative, holeNative)
       const total = factor * factor;
 
       const R = 6;             // disc radius, native px -- std area ~pi*36=113, >> despeckleNative=24
-      const coreRadius = 1;    // fully-saturated nucleus radius -- area <= SPUR_AREA_CAP(4)
+      const coreRadius = 0;    // fully-saturated nucleus radius -- 0 gives a true 1-block
+                                // core (Gauge caught coreRadius=1 giving a 5-block core,
+                                // which sits ABOVE production's spurArea=4 -- so at the
+                                // value that actually ships, both the old unguarded code
+                                // and the new boundary-gated code already skip removal via
+                                // the size gate alone, and the fixture never exercised the
+                                // boundary check at spurArea=4 at all. 0 gives area=1,
+                                // safely <= SPUR_AREA_CAP(4).
       const cx = Math.floor(w / 2), cy = Math.floor(h / 2);
 
       function setBlockFull(nx, ny) {
