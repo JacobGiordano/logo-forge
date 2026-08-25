@@ -144,13 +144,65 @@ function fillSmallHoles(mask, width, height, maxArea) {
   return next;
 }
 
+// Read-only sibling of removeSmallComponents: labels 8-connected
+// foreground components without mutating the mask, returning a
+// component-id-per-cell array plus an id -> area map. Copied verbatim from
+// sweep-despeckle-threshold.mjs's labelComponents -- keep in sync.
+function labelComponents(mask, width, height) {
+  const labels = new Int32Array(mask.length).fill(-1);
+  const areas = new Map();
+  const visited = new Uint8Array(mask.length);
+  const queue = new Int32Array(mask.length);
+  let nextId = 0;
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || visited[start]) continue;
+    const id = nextId++;
+    let head = 0, tail = 0, area = 0;
+    queue[tail++] = start; visited[start] = 1;
+    while (head < tail) {
+      const idx = queue[head++];
+      labels[idx] = id; area++;
+      const x = idx % width, y = Math.floor(idx / width);
+      const push = (nIdx) => { if (mask[nIdx] && !visited[nIdx]) { visited[nIdx] = 1; queue[tail++] = nIdx; } };
+      if (x > 0) push(idx - 1);
+      if (x < width - 1) push(idx + 1);
+      if (y > 0) push(idx - width);
+      if (y < height - 1) push(idx + width);
+      if (x > 0 && y > 0) push(idx - width - 1);
+      if (x < width - 1 && y > 0) push(idx - width + 1);
+      if (x > 0 && y < height - 1) push(idx + width - 1);
+      if (x < width - 1 && y < height - 1) push(idx + width + 1);
+    }
+    areas.set(id, area);
+  }
+  return { labels, areas };
+}
+
 // Block-approx cheap despeckle: downsample fine mask to native res via
 // majority vote, clean at native res (cheap), apply flip decisions back to
 // fine res by flattening only CHANGED blocks. No BFS buffer is ever
 // allocated at the fine (upsampled) resolution.
+//
+// Rule finalized by issue #35 (see sweep-despeckle-threshold.mjs and
+// js/bilinear-worker.js's cheapDespeckle for the full rationale, including
+// why the first attempt -- requiring ALL factor x factor fine pixels
+// foreground -- was a correctness bug that deleted legitimate hairline
+// strokes). Standard 50%-vote despeckle/hole-fill runs unchanged; a
+// separate read-only pass over a stricter 100%-vote view then strips only
+// components whose isolated area is tiny (<= SPUR_AREA_CAP, also capped by
+// despeckleNative) AND that actually touch std-background somewhere
+// (excludes the fully-interior core of a small-but-legitimate shape, e.g.
+// a small dot/period -- a second review round found the size-only version
+// of this pass could carve a permanent interior hole into one; see
+// js/bilinear-worker.js's cheapDespeckle and
+// sweep-despeckle-threshold.mjs's small-dot-core case). Validated at
+// factor=2 only, do not reuse at factor=4 without re-sweeping.
+const SPUR_AREA_CAP = 4;
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
-  const coarse = new Uint8Array(w * h);
-  const half = (factor * factor) / 2;
+  const coarseStd = new Uint8Array(w * h);
+  const coarseStrict = new Uint8Array(w * h);
+  const total = factor * factor;
+  const half = total / 2;
   for (let ny = 0; ny < h; ny++) {
     for (let nx = 0; nx < w; nx++) {
       let sum = 0;
@@ -159,11 +211,44 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
         const row = (fy0 + dy) * ow + fx0;
         for (let dx = 0; dx < factor; dx++) sum += fineMask[row + dx];
       }
-      coarse[ny * w + nx] = sum >= half ? 1 : 0;
+      const idx = ny * w + nx;
+      coarseStd[idx] = sum >= half ? 1 : 0;
+      coarseStrict[idx] = sum === total ? 1 : 0;
     }
   }
-  let cleaned = removeSmallComponents(coarse, w, h, despeckleNative);
+  let cleaned = removeSmallComponents(coarseStd, w, h, despeckleNative);
   cleaned = fillSmallHoles(cleaned, w, h, holeNative);
+
+  const spurArea = despeckleNative > 0 ? Math.min(despeckleNative, SPUR_AREA_CAP) : 0;
+  if (spurArea > 0) {
+    const { labels, areas } = labelComponents(coarseStrict, w, h);
+    const touchesStdBackground = new Map();
+    for (let ny = 0; ny < h; ny++) {
+      for (let nx = 0; nx < w; nx++) {
+        const idx = ny * w + nx;
+        const id = labels[idx];
+        if (id === -1 || touchesStdBackground.get(id)) continue;
+        let touches = nx === 0 || ny === 0 || nx === w - 1 || ny === h - 1;
+        for (let dy = -1; dy <= 1 && !touches; dy++) {
+          for (let dx = -1; dx <= 1 && !touches; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const ny2 = ny + dy, nx2 = nx + dx;
+            if (ny2 < 0 || ny2 >= h || nx2 < 0 || nx2 >= w) continue;
+            if (cleaned[ny2 * w + nx2] === 0) touches = true;
+          }
+        }
+        if (touches) touchesStdBackground.set(id, true);
+        else if (!touchesStdBackground.has(id)) touchesStdBackground.set(id, false);
+      }
+    }
+    for (let i = 0; i < cleaned.length; i++) {
+      if (cleaned[i] !== 1 || coarseStrict[i] !== 1) continue;
+      const id = labels[i];
+      if (areas.get(id) > spurArea) continue;
+      if (!touchesStdBackground.get(id)) continue;
+      cleaned[i] = 0;
+    }
+  }
 
   // apply back: only touch fine blocks whose coarse decision changed
   const out = fineMask; // mutate in place, no extra fine-res allocation
@@ -171,7 +256,7 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
   for (let ny = 0; ny < h; ny++) {
     for (let nx = 0; nx < w; nx++) {
       const idx = ny * w + nx;
-      if (coarse[idx] === cleaned[idx]) continue;
+      if (coarseStd[idx] === cleaned[idx]) continue;
       blocksChanged++;
       const v = cleaned[idx];
       const fy0 = ny * factor, fx0 = nx * factor;
