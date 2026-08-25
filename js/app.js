@@ -394,6 +394,34 @@ document.getElementById('custom-color').addEventListener('input', e => {
 // selection view instead.
 const SELECT_SKIP_MAX_DIM = 256;
 
+// ── Upload-size safety net (issue #37) ──────────────────────────────────
+// #34's production manual verification found this app's whole-pipeline
+// crash ceiling is real and mechanism-independent: full renderer-process
+// crashes were reproduced with FINAL OUTPUT resolution in the ~7300-8000px
+// range, regardless of whether that resolution came from bilinear-2x,
+// Scale2x-2x, or — the gap this issue closes — a native upload that's
+// already that large with no upscale involved at all.
+// BILINEAR_NATIVE_SAFE_LIMIT (below) only stops the app from upscaling
+// INTO that zone; it does nothing to stop someone uploading an
+// already-oversized image and landing in the same crash class at native
+// resolution, since above that limit the pipeline traces at native 1x —
+// i.e. output resolution == upload resolution once no upscale happens.
+// This is that missing check, evaluated on the raw uploaded dimensions as
+// early as possible (top of img.onload), before SELECT_SKIP_MAX_DIM or any
+// other upload handling runs.
+//
+// 6000 is chosen well clear of the measured crash zone's LOWER bound
+// (7300), not its midpoint — #32's findings describe the crash as "flaky
+// near the ceiling" (same inputs, different outcomes across repeated
+// attempts), so this errs toward a wider margin than the ~150-300px margin
+// BILINEAR_NATIVE_SAFE_LIMIT uses for its internal, non-user-facing gate.
+// A hard upload rejection is a worse failure mode to get wrong than an
+// internal fallback choice, and there's no measured "last safe" data point
+// this close to the ceiling to anchor a tighter number against — this is a
+// judgment call flagged for Tempo review, not a value read off a data
+// point the way BILINEAR_NATIVE_SAFE_LIMIT's was.
+const MAX_UPLOAD_DIM = 6000;
+
 function handleFile(file) {
   if (!file || !file.type.startsWith('image/')) return;
   // Kick off the potrace-wasm module load opportunistically here rather
@@ -411,6 +439,20 @@ function handleFile(file) {
   reader.onload = e => {
     const img = new Image();
     img.onload = () => {
+      // Reject pathologically large uploads before any other handling —
+      // see MAX_UPLOAD_DIM above. Deliberately does not call finalizeImage
+      // or openSelectionView; the app is left exactly as it was before
+      // this upload (dropzone still showing, trace-btn untouched) rather
+      // than proceeding into a state that risks the crash this exists to
+      // prevent.
+      if (Math.max(img.width, img.height) > MAX_UPLOAD_DIM) {
+        setStatus(
+          'Image too large (' + img.width + '×' + img.height + 'px) — this app supports uploads up to ' +
+          MAX_UPLOAD_DIM + 'px on the longest side. Larger images risk crashing the tab during tracing.',
+          'err'
+        );
+        return;
+      }
       if (img.width <= SELECT_SKIP_MAX_DIM && img.height <= SELECT_SKIP_MAX_DIM) {
         finalizeImage(img, e.target.result);
       } else {
