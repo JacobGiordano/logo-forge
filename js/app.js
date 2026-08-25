@@ -58,6 +58,53 @@ const BILINEAR_NATIVE_SAFE_LIMIT = 3500;
 // margin is large.
 const BILINEAR_WORKER_TIMEOUT_MS = 20000;
 
+// ── Small-source smoothing/despeckle scaling (issue #39) ────────────────
+// smoothMask's 3x3 majority-vote thresholds and the fixed despeckleNative
+// default (24, index.html) were both tuned against "normal"-sized source
+// images. At low native resolution (e.g. a ~42x55px crop) a single glyph
+// stroke is only ~1-2px wide x 8-12px tall — right in the geometry these
+// two mechanisms were never tuned for:
+//   - smoothMask: a straight 1px-wide stroke pixel only ever scores
+//     sum=3 (itself + the two neighbors along the stroke), so the default
+//     "foreground survives at sum>=4" rule deletes it outright; a 1px gap
+//     between two adjacent solid shapes can score sum=6 on the flip-to-
+//     foreground side, bridging them.
+//   - despeckleNative: a ~8-24px^2 stroke component sits squarely inside
+//     the default despeckle=24 "delete this" zone that removeSmallComponents
+//     (native path) and cheapDespeckle (bilinear path) both consume
+//     identically.
+// SMALL_SOURCE_DIM reuses the value SELECT_SKIP_MAX_DIM (below) already
+// established elsewhere in this file as the "small source" cutoff, rather
+// than inventing a second magic number for the same underlying notion.
+// Below it: smoothMask relaxes its vote thresholds (survive at sum>=3
+// instead of >=4; flip-to-foreground pushed to sum>=7 instead of >=6, so
+// gap-bridging gets HARDER, not easier, at the same time strokes stop
+// getting deleted) and despeckleNative's effective threshold scales down
+// linearly with the native minimum dimension. At/above it: both mechanisms
+// are byte-for-byte unchanged from pre-#39 behavior — this only softens
+// the low-resolution corner case, it does not change normal-sized sources.
+const SMALL_SOURCE_DIM = 256;
+
+// Issue #39: same small-source scaling rationale as smoothMask above (see
+// SMALL_SOURCE_DIM's comment) — a fixed despeckleNative area threshold is
+// oversized relative to actual glyph-stroke geometry once native
+// dimensions drop below SMALL_SOURCE_DIM. Scale the effective threshold
+// down proportionally to the native minimum dimension below that
+// reference so thin strokes stop reading as speckle, while leaving
+// normal-sized sources (minDim >= SMALL_SOURCE_DIM) completely unchanged.
+// Shared by both consumers of despeckleNative: removeSmallComponents
+// (native pipeline, below) and cheapDespeckle (bilinear Worker pipeline,
+// js/bilinear-worker.js) — the latter via the value handed to
+// runBilinearWorker in runBilinearPresupersample, so the Worker itself
+// needs no changes.
+function scaledDespeckleThreshold(despeckleSetting, width, height) {
+  if (despeckleSetting <= 0) return 0;
+  const minDim = Math.min(width, height);
+  if (minDim >= SMALL_SOURCE_DIM) return despeckleSetting;
+  const scale = minDim / SMALL_SOURCE_DIM;
+  return Math.max(1, Math.round(despeckleSetting * scale));
+}
+
 const CONTROL_DEFS = [
   { id: 'threshold-mode', valueId: null, decimals: 0 },
   { id: 'threshold', valueId: 'v-threshold', decimals: 0 },
@@ -1640,7 +1687,7 @@ async function preprocessImageData(imgData, settings, invert) {
     }
 
     if (settings.despeckle > 0) {
-      mask = removeSmallComponents(mask, width, height, settings.despeckle);
+      mask = removeSmallComponents(mask, width, height, scaledDespeckleThreshold(settings.despeckle, width, height));
     }
 
     if (settings.holePreservation > 0) {
@@ -1753,7 +1800,7 @@ async function runBilinearPresupersample(luminanceContinuous, luminance, width, 
     factor: 2,
     threshold: resolvedThreshold,
     invert,
-    despeckleNative: settings.despeckle,
+    despeckleNative: scaledDespeckleThreshold(settings.despeckle, width, height),
     holeNative: settings.holePreservation,
   });
 
@@ -1966,6 +2013,13 @@ function computeOtsuThreshold(hist, total) {
 }
 
 function smoothMask(mask, width, height, passes) {
+  // See SMALL_SOURCE_DIM's comment (issue #39): below that native-dimension
+  // cutoff, relax the survive vote (fewer neighbors needed to keep a thin
+  // stroke pixel alive) and tighten the flip vote (more neighbors needed to
+  // bridge a 1px gap into a false join) versus the normal-size defaults.
+  const small = Math.min(width, height) < SMALL_SOURCE_DIM;
+  const surviveAt = small ? 3 : 4;
+  const flipAt = small ? 7 : 6;
   let current = mask;
   for (let pass = 0; pass < passes; pass++) {
     const next = new Uint8Array(mask.length);
@@ -1983,9 +2037,9 @@ function smoothMask(mask, width, height, passes) {
         }
         const idx = y * width + x;
         if (current[idx]) {
-          next[idx] = sum >= 4 ? 1 : 0;
+          next[idx] = sum >= surviveAt ? 1 : 0;
         } else {
-          next[idx] = sum >= 6 ? 1 : 0;
+          next[idx] = sum >= flipAt ? 1 : 0;
         }
       }
     }
