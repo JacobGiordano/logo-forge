@@ -372,6 +372,147 @@ test.describe('selection UI — touch input (issue #18: mobile drag-select)', ()
   });
 });
 
+test.describe('selection UI — Center button (regression for #38)', () => {
+  // #38: clicking Center (#select-center-btn -> centerSubjectInFrame(),
+  // js/app.js:1108) can visibly shift the image to a position that doesn't
+  // match the detected subject's bounding box. Root cause: onSelectDragEnd's
+  // 'new'-drag-mode branch (js/app.js:1055-1064) calls clampPanToBox(
+  // selectionBox), which can silently correct imagePanX/Y, but — unlike
+  // every other call site that mutates the pan — never follows it with
+  // redrawSelectCanvasBackground(). The canvas pixels stay stale (drawn at
+  // the OLD pan) while imagePanX/Y already holds the NEW, corrected value.
+  // centerSubjectInFrame() then reads those stale pixels via
+  // ctx.getImageData (js/app.js:1114) to compute its centering delta, and
+  // adds that delta to the ALREADY-corrected pan (js/app.js:1154-1155) —
+  // double-counting the silent correction.
+  //
+  // Given a pan value X0 that's stale on-screen when a fresh box's
+  // clampPanToBox silently corrects it to X1, the algebra falls out cleanly:
+  // the same subject-source-region renders at a display position that
+  // shifts by exactly (X0-X1) between the two pan states (since display
+  // position = source*scale + pan), so the delta computed from the stale
+  // (X0) rendering equals (delta that would be computed from the correct X1
+  // rendering) + (X1-X0). Buggy final pan = X1 + that stale delta =
+  // (correct final pan) + (X1-X0). In other words, the bug's error is
+  // exactly the silently-corrected pan delta, added on top of whatever a
+  // correct centering would have done — so a *large* silent correction
+  // produces a large, easily observable mis-centering, which is what this
+  // test deliberately engineers.
+  //
+  // Repro, mirroring the issue's repro path:
+  //  1. Zoom in (creates room to pan) — deterministic, button-anchored at
+  //     canvas center, so imagePanX/Y land on an exact, reproducible value
+  //     (no mouse-drag imprecision).
+  //  2. Draw an initial box A, then drag-pan *inside* it hard in one
+  //     direction, repeatedly, until imagePanX/Y saturate box A's own
+  //     clampPanToBox bound (js/app.js:634-641) — this bound only
+  //     guarantees box A's own region stays covered, not the whole canvas,
+  //     so this deliberately leaves a large swath of the canvas uncovered
+  //     (transparent) once panned this far. Each of these drags calls
+  //     redrawSelectCanvasBackground() on every move (js/app.js:1022,1028),
+  //     so the canvas is always in sync up through this point — nothing
+  //     buggy has happened yet.
+  //  3. Draw a brand-new box B ('new' drag mode) spanning most of the
+  //     canvas width, on the *opposite* side from where step 2 pushed the
+  //     pan. Its far edge now requires far more coverage than the current
+  //     (saturated) pan provides, so onSelectDragEnd's clampPanToBox(B)
+  //     forces a large correction — but per the bug, no redraw follows, so
+  //     the canvas keeps showing box A's post-pan pixels while imagePanX/Y
+  //     silently jumps.
+  //  4. Click Center. Per the bug, this reads the stale (box-A-era) pixels,
+  //     which happen to show the square icon sitting in the LEFT portion of
+  //     box B's frame. A correct centering would end up with the icon
+  //     comfortably inside the frame with margin on both sides (the icon is
+  //     roughly half the frame's width). The double-counted correction
+  //     instead pushes the icon hard to the RIGHT, right up against the
+  //     frame's far edge — verified below by sampling a point 8px in from
+  //     that far edge: it must NOT be subject-colored if centering behaved
+  //     correctly, but the bug drives it fully opaque black.
+  //
+  // This exact numeric setup (zoom to exactly 150%, specific drag pixel
+  // coordinates) was derived empirically against SHEET_FIXTURE and is
+  // deterministic: the pan values that matter are all clamp-saturated
+  // (step 2 repeats the drag until the bound is hit, and step 3's box
+  // spans almost the full canvas width), so minor sub-pixel differences in
+  // where a drag lands don't change the outcome.
+  test('Center does not leave the subject flush against the frame edge after a fresh box triggers a silent pan correction', async ({ page }) => {
+    await uploadSheet(page);
+    const cb = await canvasBox(page);
+
+    await page.locator('#select-zoom-in-btn').click();
+    await expect(page.locator('#select-zoom-readout')).toHaveText('150%');
+
+    // Box A: drawn well clear of the canvas edges.
+    await dragOnCanvas(page, 10, 10, 90, 90);
+
+    // Pan hard inside box A, away from handles (85,50 is not within
+    // hitTestHandle's 8px tolerance of any of box A's four corners), far
+    // enough off-canvas that eventToCanvasPoint's clamp saturates the
+    // drag. Repeated twice so imagePanX/Y actually reach box A's
+    // clampPanToBox bound rather than just approaching it.
+    for (let i = 0; i < 2; i++) {
+      await page.mouse.move(cb.x + 85, cb.y + 50);
+      await page.mouse.down();
+      await page.mouse.move(cb.x - 500, cb.y - 500, { steps: 5 });
+      await page.mouse.up();
+    }
+
+    // Sanity check: this pan has left the canvas genuinely partially
+    // uncovered (transparent), the precondition #38 depends on.
+    const gapAlpha = await page.evaluate(() => {
+      const el = document.getElementById('select-canvas') as HTMLCanvasElement;
+      return el.getContext('2d')!.getImageData(250, 240, 1, 1).data[3];
+    });
+    expect(gapAlpha).toBe(0);
+
+    // Box B: a brand-new 'new'-mode drag spanning almost the full canvas
+    // width, reaching to the opposite side from where box A's pan just
+    // saturated. Its far (right) edge is well beyond what the current pan
+    // covers, so onSelectDragEnd's clampPanToBox(B) must silently correct
+    // imagePanX/Y by a large amount to keep it covered.
+    await dragOnCanvas(page, 10, 150, 255, 245);
+    await expect(page.locator('#select-rect')).toBeVisible();
+    const rectBefore = await page.locator('#select-rect').boundingBox();
+
+    // Reads full RGBA (samplePixel only returns RGB) — needed because a
+    // transparent (uncovered) pixel and an opaque black subject pixel both
+    // read r=0, and this check specifically needs to tell them apart.
+    async function samplePixelRGBA(x: number, y: number): Promise<[number, number, number, number]> {
+      return page.evaluate(({ x, y }) => {
+        const el = document.getElementById('select-canvas') as HTMLCanvasElement;
+        const d = el.getContext('2d')!.getImageData(x, y, 1, 1).data;
+        return [d[0], d[1], d[2], d[3]] as [number, number, number, number];
+      }, { x, y });
+    }
+
+    // Before Center: a point 8px in from box B's right edge is NOT the
+    // opaque black subject — it's either background or part of the
+    // transparent gap left over from box A's pan (both fine; what matters
+    // is it is not yet the solid icon).
+    const beforeCenter = await samplePixelRGBA(250, 165);
+    expect(beforeCenter[0] === 0 && beforeCenter[3] === 255).toBe(false);
+
+    await page.locator('#select-center-btn').click();
+
+    // The frame overlay itself never moves on Center — only pan does.
+    const rectAfter = await page.locator('#select-rect').boundingBox();
+    expect(Math.abs(rectAfter!.x - rectBefore!.x)).toBeLessThan(1);
+    expect(Math.abs(rectAfter!.y - rectBefore!.y)).toBeLessThan(1);
+
+    // The regression check: the subject the app just "centered" is roughly
+    // half the frame's width, so a correct centering leaves comfortable
+    // background margin on both sides — this point 8px in from the far
+    // edge should still read as opaque background (centerSubjectInFrame's
+    // own clampPanToBox call guarantees the frame is fully covered/opaque
+    // by this point either way). #38's double-counted correction instead
+    // drives the subject hard against that edge, turning this pixel fully
+    // opaque black.
+    const afterCenter = await samplePixelRGBA(250, 165);
+    expect(afterCenter[3]).toBe(255);
+    expect(afterCenter[0]).toBeGreaterThan(200);
+  });
+});
+
 test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-finger pan)', () => {
   test.use({ hasTouch: true });
 
