@@ -11,29 +11,45 @@
 // vote in either adjacent block, so it's invisible to despeckle and its
 // original fine-resolution pixels survive untouched).
 //
-// This sweep tested two directions the findings doc raised: (1) a uniform
-// non-50% vote fraction, (2) an asymmetric threshold (stricter on
-// despeckle's removal side, standard 50% on hole-fill's side, chained by
-// applying despeckle's strict-vote removal decisions onto the standard-vote
-// baseline before hole-fill runs -- see the `asymmetric` variant kind
-// below). Counter to the findings doc's initial guess, LOWERING the
-// removal-side threshold (easier to register as foreground) made both
-// cases measurably worse, not better -- it merges isolated noise/AA-edge
-// pixels into larger connected coarse components that exceed the despeckle
-// area threshold and survive, actually growing fragment/path counts (see
-// uniform-any-pixel/uniform-25pct results below). RAISING the threshold to
-// 100% (a block only counts as foreground if EVERY fine pixel in it is
-// foreground -- an AND-downsample instead of a majority vote) is what
-// closes the gap: at factor=2 (production's only value -- see
-// js/bilinear-worker.js's cheapDespeckle) it exactly matches full-BFS
-// despeckle's pathCount/fragCount on aa-wordmark while leaving noisy-logo
-// bit-identical, across every despeckleNative/holeNative pairing tested
-// (0/0, default 24/12, 48/24, 4/4). At factor=4 the same rule is
-// catastrophic (pathCount balloons 10x+) -- irrelevant to what ships today
-// since factor is hardcoded to 2, but a landmine if that ever changes
-// without re-running this sweep. Uniform and asymmetric variants perform
-// almost identically at the winning threshold; uniform was ported to
-// production for simplicity (see js/bilinear-worker.js).
+// This sweep tested three directions across two rounds. Round 1 (pre-review)
+// tried (1) a uniform non-50% vote fraction, (2) an asymmetric threshold
+// (stricter on despeckle's removal side, standard 50% on hole-fill's side --
+// see the `asymmetric` variant kind below). Counter to the findings doc's
+// initial guess, LOWERING the removal-side threshold (easier to register as
+// foreground) made both cases measurably worse -- it merges isolated
+// noise/AA-edge pixels into larger connected coarse components that exceed
+// the despeckle area threshold and survive, growing fragment/path counts
+// (uniform-any-pixel/uniform-25pct). RAISING it to 100% (every fine pixel in
+// a block must be foreground -- an AND-downsample, not a majority vote) DID
+// close the aa-wordmark gap exactly, at factor=2, and was shipped in commit
+// a4e47c9 -- but a Gauge pre-merge review caught a real correctness bug: it
+// deletes legitimate thin content (hairline strokes/fine serifs) whose
+// coarse footprint sits near despeckleNative, because it severs EVERY
+// weakly-covered (~50%) bridge indiscriminately, real stroke-to-AA-edge or
+// noise-to-real-geometry alike. See tickSurvival()'s header comment for the
+// synthetic regression case that caught this (uniform-75pct/90pct/100pct and
+// asym-remove-75pct/90pct/100pct all fail it identically, since they all key
+// removal off the STRICT view's severed component size).
+//
+// Round 2 (post-review) adds the `decoupled` variant kind: run the standard
+// 50%-vote pipeline UNCHANGED (tick-safe by construction, since it's exactly
+// the pre-#35 baseline) and layer a SEPARATE small-area-only removal pass on
+// top, using the 100%-vote view's connected components (read-only, via
+// labelComponents) purely to size candidates -- strip a block only if it's
+// foreground in the standard pass's output AND its isolated 100%-vote
+// component is tiny (<= spurArea). This is what actually satisfies "small
+// under both a strict and a lenient view": aa-wordmark's stray fragment is a
+// ~1-block noise speck under the strict view (small under both), while the
+// hairline ticks' severed core is ~22 blocks (small under the strict view
+// alone, but NOT small under the lenient/standard view, where it merges with
+// its AA edge into a ~44-block component) -- so decoupled removes the former
+// and correctly leaves the latter alone. spurArea in {1,2,4,8,12} all
+// produced identical results in this sweep (exact match on aa-wordmark,
+// bit-identical noisy-logo, 100% tick survival, across despeckleNative in
+// {4, 24, 48}); spur4 was ported to production as SPUR_AREA_CAP (see
+// js/bilinear-worker.js's cheapDespeckle) -- comfortably above real noise
+// specks (~1 block) and comfortably below real thin strokes (~20+ blocks at
+// default despeckleNative=24), with headroom either direction.
 //
 // Requires a dev server already running (BASE_URL below must match).
 // Optional env vars: DESPECKLE_NATIVE, HOLE_NATIVE (default 24/12, matching
@@ -108,6 +124,41 @@ function removeSmallComponents(mask, width, height, maxArea) {
   }
   return next;
 }
+// Labels 8-connected foreground components in \`mask\` and returns a same-
+// length Int32Array of component-id per cell (-1 for background) plus a
+// Map of componentId -> area. Used by the 'decoupled' variant to size a
+// component WITHOUT removing anything (removeSmallComponents both finds
+// and mutates in one pass; here we need sizes only, read-only).
+function labelComponents(mask, width, height) {
+  const labels = new Int32Array(mask.length).fill(-1);
+  const areas = new Map();
+  const visited = new Uint8Array(mask.length);
+  const queue = new Int32Array(mask.length);
+  let nextId = 0;
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || visited[start]) continue;
+    const id = nextId++;
+    let head = 0, tail = 0, area = 0;
+    queue[tail++] = start; visited[start] = 1;
+    while (head < tail) {
+      const idx = queue[head++];
+      labels[idx] = id;
+      area++;
+      const x = idx % width, y = Math.floor(idx / width);
+      const push = (nIdx) => { if (mask[nIdx] && !visited[nIdx]) { visited[nIdx] = 1; queue[tail++] = nIdx; } };
+      if (x > 0) push(idx - 1);
+      if (x < width - 1) push(idx + 1);
+      if (y > 0) push(idx - width);
+      if (y < height - 1) push(idx + width);
+      if (x > 0 && y > 0) push(idx - width - 1);
+      if (x < width - 1 && y > 0) push(idx - width + 1);
+      if (x > 0 && y < height - 1) push(idx + width - 1);
+      if (x < width - 1 && y < height - 1) push(idx + width + 1);
+    }
+    areas.set(id, area);
+  }
+  return { labels, areas };
+}
 function fillSmallHoles(mask, width, height, maxArea) {
   if (maxArea <= 0) return mask;
   const next = new Uint8Array(mask);
@@ -144,6 +195,40 @@ function fillSmallHoles(mask, width, height, maxArea) {
 //          only where despeckle explicitly removed something. This keeps
 //          hole-fill's behavior identical to today's shipped version except
 //          where despeckle's stricter pass found something to remove.
+//   { kind: 'decoupled', spurArea: N }
+//       -- Gauge's #35-review-suggested "small under BOTH a strict AND a
+//          lenient view" rule, actually implemented (not just an existing
+//          variant relabeled). Root-caused via _system/potrace-spike's
+//          debug pass on aa-wordmark: the stray fragment isn't an
+//          invisible-below-50%-everywhere speck (the findings-doc's
+//          original guess) -- it's a fully-saturated 1-native-block noise
+//          speck that sits ADJACENT to real letter geometry and is bridged
+//          into that big legitimate component by one weakly-covered (near
+//          50%) block, so the STANDARD 50% view's connected-component
+//          analysis never isolates it (it's structurally "attached" to a
+//          huge, clearly-not-small shape) and removeSmallComponents never
+//          gets a chance to evaluate it on its own. The 100pct-vote fix
+//          "worked" only because it happens to sever that same weak bridge
+//          for EVERY thin feature, real or noise, indiscriminately --
+//          which is exactly what deletes the hairline ticks (a real stroke
+//          bridged into its own antialiased edge column the same way).
+//          A block-vote-based coarse mask fundamentally cannot tell "a
+//          couple of blocks of noise bridged onto real geometry" from "a
+//          thin real stroke bridged onto its own AA edge" by connectivity
+//          shape alone -- both sever into an isolated small strict
+//          component when the bridge is cut. The two ARE distinguishable
+//          by SIZE: the noise speck's isolated strict component is ~1
+//          block; the tick's is ~22 (near despeckleNative itself). So:
+//          run the standard 50%-vote pipeline UNCHANGED (this is exactly
+//          today's shipped behavior, tick-safe by construction) as the
+//          baseline, then run a SEPARATE, much smaller-area removal pass
+//          using the 100%-vote's connected components (labeled, not
+//          mutated) to catch only genuinely tiny attached specks
+//          (isolated strict-component area <= spurArea, default small --
+//          e.g. 2-4 blocks) that the standard pass's bridging blindness
+//          let slip through attached to legitimate shapes. Anything whose
+//          isolated strict-component area is above spurArea (a real thin
+//          stroke) is left exactly as the standard pass decided.
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative, variant) {
   const total = factor * factor;
   const half = total / 2;
@@ -180,6 +265,55 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
       }
     }
     return { mask: out, blocksChanged, totalBlocks: w * h };
+  }
+
+  if (variant.kind === 'decoupled') {
+    const coarseStd = new Uint8Array(w * h);
+    const coarseStrict = new Uint8Array(w * h);
+    for (let ny = 0; ny < h; ny++) {
+      for (let nx = 0; nx < w; nx++) {
+        let sum = 0;
+        const fy0 = ny * factor, fx0 = nx * factor;
+        for (let dy = 0; dy < factor; dy++) {
+          const row = (fy0 + dy) * ow + fx0;
+          for (let dx = 0; dx < factor; dx++) sum += fineMask[row + dx];
+        }
+        const idx = ny * w + nx;
+        coarseStd[idx] = sum >= half ? 1 : 0;
+        coarseStrict[idx] = sum === total ? 1 : 0;
+      }
+    }
+    // Standard pipeline, unchanged -- this IS today's shipped behavior.
+    const cleanedStd = fillSmallHoles(removeSmallComponents(coarseStd, w, h, despeckleNative), w, h, holeNative);
+
+    // Read-only sizing pass over the strict (100%) view -- find isolated
+    // strict components small enough to be spurs, and strip only those
+    // from the standard pipeline's result.
+    const { labels, areas } = labelComponents(coarseStrict, w, h);
+    const final = new Uint8Array(cleanedStd);
+    let spurBlocksRemoved = 0;
+    for (let i = 0; i < final.length; i++) {
+      if (final[i] !== 1 || coarseStrict[i] !== 1) continue;
+      const area = areas.get(labels[i]);
+      if (area <= variant.spurArea) { final[i] = 0; spurBlocksRemoved++; }
+    }
+
+    const out = fineMask;
+    let blocksChanged = 0;
+    for (let ny = 0; ny < h; ny++) {
+      for (let nx = 0; nx < w; nx++) {
+        const idx = ny * w + nx;
+        if (coarseStd[idx] === final[idx]) continue;
+        blocksChanged++;
+        const v = final[idx];
+        const fy0 = ny * factor, fx0 = nx * factor;
+        for (let dy = 0; dy < factor; dy++) {
+          const row = (fy0 + dy) * ow + fx0;
+          for (let dx = 0; dx < factor; dx++) out[row + dx] = v;
+        }
+      }
+    }
+    return { mask: out, blocksChanged, totalBlocks: w * h, spurBlocksRemoved };
   }
 
   // asymmetric
@@ -360,6 +494,99 @@ async function buildMask(page, dataUrl, factor, variant) {
   );
 }
 
+// Thin-stroke (hairline-tick) regression case added after Gauge's #35
+// pre-merge review: uniform-100pct fixes aa-wordmark's stray fragment but
+// deletes legitimate thin content whose coarse footprint sits near
+// despeckleNative.
+//
+// First attempt at this case (see git history on this branch) drew real
+// canvas lines and ran them through the actual bilinear+Otsu pipeline --
+// that MISFIRED: Otsu's threshold, computed on the real histogram,
+// resolved the antialiased edge to a single fully-saturated native column
+// with ZERO contribution from the adjacent column (not the ~50/50 split a
+// canvas AA line usually produces), so the tick's baseline (50%) coarse
+// component was ALREADY only ~22 blocks -- already at/under
+// despeckleNative=24 and deleted by baseline too. That doesn't reproduce
+// Gauge's regression (baseline preserves, 100% deletes); it just shows a
+// separately-known "content below the despeckle threshold gets removed"
+// case that both rules agree on. Canvas/Otsu numerical behavior isn't
+// reliable enough to hit the specific vote pattern under test.
+//
+// This version constructs the fine mask directly instead, with exact
+// control per native block -- deterministic, reproducible, no
+// canvas/Otsu involved. Each of 4 ticks is a tickLen-native-pixel-long
+// vertical stroke straddling two adjacent native columns: the "core"
+// column is FULLY saturated every row (sum === factor*factor, matching a
+// stroke whose true center sits inside that column), the "fringe" column
+// is at EXACTLY the classic 50%-vote boundary every row (sum ===
+// floor(factor*factor/2) -- the textbook antialiased edge case). Under
+// the OLD 50% vote (sum >= half) BOTH columns register foreground, so the
+// two merge (8-connectivity, adjacent columns) into one component of
+// 2*tickLen blocks -- safely above despeckleNative=24 default, correctly
+// preserved (matches Gauge's ~41-43 for tickLen=22, 2*22=44). Under a
+// 100% ("ALL fine pixels dark") vote only the core column registers (the
+// fringe column's sum is below total), so the component shrinks to just
+// tickLen blocks -- at/under despeckleNative, DELETED outright by
+// removeSmallComponents (matches Gauge's ~21-22). fragCount/pathCount
+// can't see this failure mode (deleting a whole tick doesn't change
+// potrace's path *count*, only its geometry) -- that's exactly why the
+// original two-case harness missed it; this measures foreground pixel
+// survival directly in the fine mask instead.
+async function tickSurvival(page, factor, variant, despeckleNative, holeNative) {
+  return page.evaluate(
+    ({ factor, variant, despeckleNative, holeNative, sharedFns }) => {
+      const build = new Function(sharedFns + '; return { cheapDespeckle };');
+      const { cheapDespeckle } = build();
+
+      const w = 240, h = 240; // native size, matches WORK_SIZE
+      const ow = w * factor, oh = h * factor;
+      const total = factor * factor;
+      const half = Math.floor(total / 2); // exactly-50%-vote fringe sum
+
+      const tickLen = 22;
+      const cols = [30, 80, 130, 180]; // 4 well-separated native x positions
+      const y0 = Math.floor(h * 0.5 - tickLen / 2);
+      const ticks = cols.map(c => ({ core: c, fringe: c + 1, y0, y1: y0 + tickLen }));
+
+      const mask = new Uint8Array(ow * oh);
+      function setBlock(nx, ny, sum) {
+        let remaining = sum;
+        for (let dy = 0; dy < factor && remaining > 0; dy++) {
+          for (let dx = 0; dx < factor && remaining > 0; dx++) {
+            mask[(ny * factor + dy) * ow + (nx * factor + dx)] = 1;
+            remaining--;
+          }
+        }
+      }
+      for (const t of ticks) {
+        for (let ny = t.y0; ny < t.y1; ny++) {
+          setBlock(t.core, ny, total);  // fully saturated core column
+          setBlock(t.fringe, ny, half); // exactly-50% fringe column
+        }
+      }
+
+      function tickSum(m, t) {
+        let sum = 0;
+        for (let ny = t.y0; ny < t.y1; ny++) {
+          for (const nx of [t.core, t.fringe]) {
+            for (let dy = 0; dy < factor; dy++) {
+              for (let dx = 0; dx < factor; dx++) sum += m[(ny * factor + dy) * ow + (nx * factor + dx)];
+            }
+          }
+        }
+        return sum;
+      }
+
+      const before = ticks.map(t => tickSum(mask, t));
+      const r = cheapDespeckle(mask, ow, oh, factor, w, h, despeckleNative, holeNative, variant);
+      const after = ticks.map(t => tickSum(r.mask, t));
+
+      return { before, after, despeckleInfo: { blocksChanged: r.blocksChanged, totalBlocks: r.totalBlocks } };
+    },
+    { factor, variant, despeckleNative, holeNative, sharedFns: SHARED_FNS }
+  );
+}
+
 async function runPotrace(page, dataUrl, options) {
   return page.evaluate(
     async ({ dataUrl, options }) => {
@@ -460,9 +687,16 @@ async function main() {
     { name: 'uniform-any-pixel', v: { kind: 'uniform', frac: 0.01 } },   // sum>=1 -- makes things WORSE (see file header)
     { name: 'uniform-25pct', v: { kind: 'uniform', frac: 0.25 } },       // also worse
     { name: 'uniform-75pct', v: { kind: 'uniform', frac: 0.75 } },       // no measurable effect at factor=2
-    { name: 'uniform-100pct', v: { kind: 'uniform', frac: 1.0 } },       // WINNER -- ported to production
+    { name: 'uniform-100pct', v: { kind: 'uniform', frac: 1.0 } },       // fixes aa-wordmark but DELETES hairline ticks (Gauge #35 review)
     { name: 'asym-remove-any-pixel', v: { kind: 'asymmetric', removeFrac: 0.01 } },
-    { name: 'asym-remove-100pct', v: { kind: 'asymmetric', removeFrac: 1.0 } }, // near-identical to uniform-100pct, more complex
+    { name: 'asym-remove-75pct', v: { kind: 'asymmetric', removeFrac: 0.75 } },
+    { name: 'asym-remove-90pct', v: { kind: 'asymmetric', removeFrac: 0.9 } },
+    { name: 'asym-remove-100pct', v: { kind: 'asymmetric', removeFrac: 1.0 } }, // still breaks ticks -- removal decision keys off the STRICT view's component size, same failure as uniform-100pct
+    { name: 'decoupled-spur1', v: { kind: 'decoupled', spurArea: 1 } },
+    { name: 'decoupled-spur2', v: { kind: 'decoupled', spurArea: 2 } },
+    { name: 'decoupled-spur4', v: { kind: 'decoupled', spurArea: 4 } },      // WINNER -- ported to production as SPUR_AREA_CAP
+    { name: 'decoupled-spur8', v: { kind: 'decoupled', spurArea: 8 } },
+    { name: 'decoupled-spur12', v: { kind: 'decoupled', spurArea: 12 } },
   ];
 
   const cases = {};
@@ -526,8 +760,23 @@ async function main() {
     }
   }
 
+  // hairline-ticks: direct mask-pixel survival, no potrace/diffPct involved
+  // (see tickSurvival's header comment for why fragCount/pathCount can't
+  // see this failure mode). Only factor=2 matters (production's only
+  // value), but factor=4 is reported too for completeness.
+  const tickResults = {};
+  for (const { name, v } of VARIANTS) {
+    tickResults[name] = {};
+    for (const factor of [2, 4]) {
+      const r = await tickSurvival(page, factor, v, DESPECKLE_NATIVE, HOLE_NATIVE);
+      const survivalPct = r.before.map((b, i) => b > 0 ? +(100 * r.after[i] / b).toFixed(1) : null);
+      const deletedCount = survivalPct.filter(p => p !== null && p < 20).length;
+      tickResults[name][`F${factor}`] = { before: r.before, after: r.after, survivalPct, deletedCount };
+    }
+  }
+
   console.log(JSON.stringify(cases, null, 2));
-  console.log('\n=== SUMMARY ===');
+  console.log('\n=== SUMMARY: noisy-logo / aa-wordmark (potrace-based) ===');
   for (const kind of Object.keys(cases)) {
     console.log(`\n${kind}:`);
     for (const { name } of VARIANTS) {
@@ -535,6 +784,15 @@ async function main() {
         const r = cases[kind][name][`F${factor}`];
         console.log(`  ${name.padEnd(24)} F${factor}: diffPct=${r.diffPct}%  fragCount=${r.fragCount}  pathCount=${r.pathCount}  blocksChanged=${r.blocksChanged}/${r.totalBlocks}`);
       }
+    }
+  }
+
+  console.log('\n=== SUMMARY: hairline-ticks (direct mask survival, despeckleNative=' + DESPECKLE_NATIVE + ') ===');
+  for (const { name } of VARIANTS) {
+    for (const factor of [2, 4]) {
+      const r = tickResults[name][`F${factor}`];
+      const flag = r.deletedCount > 0 ? `  <-- ${r.deletedCount}/4 TICKS DELETED` : '';
+      console.log(`  ${name.padEnd(24)} F${factor}: before=[${r.before.join(', ')}] after=[${r.after.join(', ')}] survival%=[${r.survivalPct.join(', ')}]${flag}`);
     }
   }
 
