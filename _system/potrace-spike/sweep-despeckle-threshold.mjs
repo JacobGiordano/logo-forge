@@ -290,12 +290,50 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
     // strict components small enough to be spurs, and strip only those
     // from the standard pipeline's result.
     const { labels, areas } = labelComponents(coarseStrict, w, h);
+
+    // Boundary-adjacency gate (Gauge #35-review-round-2 fix): a small
+    // strict component is only a genuine "spur attached to background on
+    // its far side" if it actually touches std-background somewhere.
+    // Without this, the spur pass can't tell that apart from the
+    // fully-saturated CORE of a small-but-legitimate shape (e.g. a dot
+    // whose AA/JPEG-softened rim keeps its whole perimeter at std=1, so
+    // its tiny 100%-saturated center is surrounded on every side by
+    // std-foreground) -- stripping that core carves a permanent interior
+    // hole, since this pass runs AFTER fillSmallHoles and nothing re-fills
+    // afterward. Computed once per component id (image-border cells count
+    // as touching background too, since off-canvas is implicitly empty).
+    const touchesBackground = new Map();
+    if (variant.requireBoundaryTouch) {
+      for (let ny = 0; ny < h; ny++) {
+        for (let nx = 0; nx < w; nx++) {
+          const idx = ny * w + nx;
+          const id = labels[idx];
+          if (id === -1 || touchesBackground.get(id)) continue;
+          let touches = nx === 0 || ny === 0 || nx === w - 1 || ny === h - 1;
+          for (let dy = -1; dy <= 1 && !touches; dy++) {
+            for (let dx = -1; dx <= 1 && !touches; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const ny2 = ny + dy, nx2 = nx + dx;
+              if (ny2 < 0 || ny2 >= h || nx2 < 0 || nx2 >= w) continue;
+              if (cleanedStd[ny2 * w + nx2] === 0) touches = true;
+            }
+          }
+          if (touches) touchesBackground.set(id, true);
+          else if (!touchesBackground.has(id)) touchesBackground.set(id, false);
+        }
+      }
+    }
+
     const final = new Uint8Array(cleanedStd);
     let spurBlocksRemoved = 0;
     for (let i = 0; i < final.length; i++) {
       if (final[i] !== 1 || coarseStrict[i] !== 1) continue;
-      const area = areas.get(labels[i]);
-      if (area <= variant.spurArea) { final[i] = 0; spurBlocksRemoved++; }
+      const id = labels[i];
+      const area = areas.get(id);
+      if (area > variant.spurArea) continue;
+      if (variant.requireBoundaryTouch && !touchesBackground.get(id)) continue;
+      final[i] = 0;
+      spurBlocksRemoved++;
     }
 
     const out = fineMask;
@@ -491,6 +529,161 @@ async function buildMask(page, dataUrl, factor, variant) {
       return { dataUrl: outCanvas.toDataURL('image/png'), width: ow, height: oh, threshold, despeckleInfo };
     },
     { dataUrl, factor, variant, despeckleNative: DESPECKLE_NATIVE, holeNative: HOLE_NATIVE, sharedFns: SHARED_FNS }
+  );
+}
+
+// small-dot-core regression case (Gauge #35-review-round-2): a small but
+// clearly-legitimate filled blob whose fully-saturated (100%-vote)
+// interior CORE is tiny (<= a spur-sized area) while its overall std
+// (50%-vote) footprint is large and entirely std-foreground around that
+// core -- the exact "interior of a legitimate shape" case an unguarded
+// spur pass can't tell apart from a real boundary-attached speck.
+//
+// First attempt at this case drew a real filled circle/rounded-rect on a
+// canvas and JPEG-degraded it (matching noisy-logo/aa-wordmark's
+// methodology, and Gauge's suggested construction) -- that MISFIRED for
+// the same root reason tickSurvival's header documents for canvas/Otsu
+// constructions: a single global Otsu threshold produces a CRISP
+// fine-resolution binary boundary, so a native block only fails the
+// 100%-vote test if that crisp boundary curve actually passes through it.
+// That failure band's block count scales with the shape's PERIMETER, not
+// blur/JPEG softening strength (measured empirically: a 7px-radius circle
+// lost only ~12 of ~154 blocks to the 100%-vote rim regardless of a 1.5-3px
+// canvas blur pre-pass) -- so for any shape round/fat enough for its std
+// area to clear despeckleNative=24, its strict-view core stays far above
+// SPUR_AREA_CAP; shrinking it further requires shrinking the whole shape
+// below despeckleNative first. Reproducing Gauge's exact vote pattern
+// organically isn't reliable here, same conclusion tickSurvival already
+// reached for the hairline-tick case.
+//
+// This version builds the fine mask directly instead (tickSurvival's
+// proven approach): a filled native-radius-R disc where EVERY block
+// (not just an edge rim) is set to exactly the classic 50%-vote fringe
+// level (sum === half) -- so the std view sees one big, uniformly
+// std-foreground disc (area ~= pi*R^2, safely above despeckleNative) --
+// except for a small coreRadius nucleus at dead center, which is set
+// fully saturated (sum === total) -- an isolated strict-view component of
+// area <= spurArea, surrounded on every side by std-foreground, never
+// touching std-background. Deterministic, reproducible, exactly matches
+// Gauge's described failure geometry without fighting Otsu.
+//
+// Runs BOTH cheapDespeckle(variant) and a full BFS despeckle/hole-fill
+// (native removeSmallComponents/fillSmallHoles run directly at fine
+// resolution, maxArea scaled by factor^2 -- no block-vote approximation
+// at all, so it can't carve a spurious hole) on separate copies of the
+// SAME input mask, renders both to PNG, and returns both dataUrls for the
+// caller to run through potrace and compare pathCount -- same instrument
+// used for the aa-wordmark case. A hole the spur pass carves shows up as
+// an extra rendered path/subpath vs. the full-BFS reference.
+async function coreHoleCheck(page, factor, variant, despeckleNative, holeNative) {
+  return page.evaluate(
+    ({ factor, variant, despeckleNative, holeNative, sharedFns }) => {
+      const build = new Function(sharedFns + '; return { removeSmallComponents, fillSmallHoles, cheapDespeckle };');
+      const { removeSmallComponents, fillSmallHoles, cheapDespeckle } = build();
+
+      const w = 240, h = 240; // native size, matches WORK_SIZE
+      const ow = w * factor, oh = h * factor;
+      const total = factor * factor;
+
+      const R = 6;             // disc radius, native px -- std area ~pi*36=113, >> despeckleNative=24
+      const coreRadius = 1;    // fully-saturated nucleus radius -- area <= SPUR_AREA_CAP(4)
+      const cx = Math.floor(w / 2), cy = Math.floor(h / 2);
+
+      function setBlockFull(nx, ny) {
+        const fy0 = ny * factor, fx0 = nx * factor;
+        for (let dy = 0; dy < factor; dy++) {
+          const row = (fy0 + dy) * ow + fx0;
+          for (let dx = 0; dx < factor; dx++) fineMask[row + dx] = 1;
+        }
+      }
+      // Fully saturated except the single fine sub-pixel at the block's
+      // OUTWARD corner (farthest from disc center) -- leaves the moat one
+      // fine pixel short of saturation (breaking strict registration)
+      // while the missing pixel's position is chosen coherently with the
+      // disc's true boundary direction, instead of an arbitrary fixed
+      // corner. This keeps the moat's un-flattened texture reading as a
+      // smooth, marginally eroded circular edge instead of jagged noise.
+      function setBlockMoat(nx, ny) {
+        setBlockFull(nx, ny);
+        const fy0 = ny * factor, fx0 = nx * factor;
+        const dx = nx >= cx ? factor - 1 : 0;
+        const dy = ny >= cy ? factor - 1 : 0;
+        fineMask[(fy0 + dy) * ow + (fx0 + dx)] = 0;
+      }
+
+      const fineMask = new Uint8Array(ow * oh);
+      let stdArea = 0, coreArea = 0;
+      const nucleus = new Set();
+      for (let ny = cy - R - 1; ny <= cy + R + 1; ny++) {
+        for (let nx = cx - R - 1; nx <= cx + R + 1; nx++) {
+          if (Math.hypot(nx - cx, ny - cy) <= coreRadius) { nucleus.add(ny * w + nx); coreArea++; }
+        }
+      }
+      // Moat = every 8-neighbor of every nucleus block that isn't itself
+      // nucleus -- an explicit morphological dilation, not a
+      // distance-threshold ring. A distance-threshold ring (an earlier
+      // version of this construction) left gaps: a nucleus block near its
+      // own radius edge can be 8-adjacent to a bulk block just outside the
+      // ring's radius cutoff, silently re-merging the nucleus into the
+      // bulk's strict component and making the whole test vacuous (the
+      // spur pass never saw an isolated nucleus to act on at all).
+      // Dilation guarantees EVERY neighbor of EVERY nucleus block is
+      // either nucleus or explicit moat, never an accidental bulk leak.
+      const moat = new Set();
+      for (const idx of nucleus) {
+        const nx = idx % w, ny = Math.floor(idx / w);
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const idx2 = (ny + dy) * w + (nx + dx);
+            if (!nucleus.has(idx2)) moat.add(idx2);
+          }
+        }
+      }
+      for (let ny = cy - R - 2; ny <= cy + R + 2; ny++) {
+        for (let nx = cx - R - 2; nx <= cx + R + 2; nx++) {
+          const idx = ny * w + nx;
+          const inDisc = Math.hypot(nx - cx, ny - cy) <= R;
+          if (nucleus.has(idx)) { setBlockFull(nx, ny); stdArea++; }
+          else if (moat.has(idx)) { setBlockMoat(nx, ny); stdArea++; }
+          else if (inDisc) { setBlockFull(nx, ny); stdArea++; }
+        }
+      }
+
+      const fullMask = new Uint8Array(fineMask); // full-BFS reference input, untouched by cheapDespeckle
+      const cheapOut = new Uint8Array(fineMask); // cheapDespeckle mutates in place
+
+      const cheapResult = cheapDespeckle(cheapOut, ow, oh, factor, w, h, despeckleNative, holeNative, variant);
+
+      const factorAreaScale = total;
+      let full = removeSmallComponents(fullMask, ow, oh, despeckleNative * factorAreaScale);
+      full = fillSmallHoles(full, ow, oh, holeNative * factorAreaScale);
+
+      function toDataUrl(mask) {
+        const img = new Uint8ClampedArray(ow * oh * 4);
+        for (let i = 0; i < mask.length; i++) {
+          const v = mask[i] ? 0 : 255;
+          const idx = i * 4;
+          img[idx] = v; img[idx + 1] = v; img[idx + 2] = v; img[idx + 3] = 255;
+        }
+        const c = document.createElement('canvas');
+        c.width = ow; c.height = oh;
+        c.getContext('2d').putImageData(new ImageData(img, ow, oh), 0, 0);
+        return c.toDataURL('image/png');
+      }
+
+      return {
+        variantDataUrl: toDataUrl(cheapOut),
+        fullDataUrl: toDataUrl(full),
+        width: ow,
+        height: oh,
+        blocksChanged: cheapResult && cheapResult.blocksChanged,
+        spurBlocksRemoved: cheapResult && cheapResult.spurBlocksRemoved,
+        stdArea,
+        coreArea,
+      };
+    },
+    { factor, variant, despeckleNative, holeNative, sharedFns: SHARED_FNS }
   );
 }
 
@@ -692,11 +885,23 @@ async function main() {
     { name: 'asym-remove-75pct', v: { kind: 'asymmetric', removeFrac: 0.75 } },
     { name: 'asym-remove-90pct', v: { kind: 'asymmetric', removeFrac: 0.9 } },
     { name: 'asym-remove-100pct', v: { kind: 'asymmetric', removeFrac: 1.0 } }, // still breaks ticks -- removal decision keys off the STRICT view's component size, same failure as uniform-100pct
+    // Round 2, pre-boundary-gate (kept for comparison only -- Gauge's
+    // second review found these carve interior holes into small
+    // legitimate shapes; see small-dot-core case below). NOT the
+    // production rule.
     { name: 'decoupled-spur1', v: { kind: 'decoupled', spurArea: 1 } },
     { name: 'decoupled-spur2', v: { kind: 'decoupled', spurArea: 2 } },
-    { name: 'decoupled-spur4', v: { kind: 'decoupled', spurArea: 4 } },      // WINNER -- ported to production as SPUR_AREA_CAP
+    { name: 'decoupled-spur4', v: { kind: 'decoupled', spurArea: 4 } },
     { name: 'decoupled-spur8', v: { kind: 'decoupled', spurArea: 8 } },
     { name: 'decoupled-spur12', v: { kind: 'decoupled', spurArea: 12 } },
+    // Round 2, boundary-gated (Gauge's suggested fix (2)): only strip a
+    // small strict component if it actually touches std-background
+    // somewhere -- excludes fully-interior small cores.
+    { name: 'decoupled-boundary-spur1', v: { kind: 'decoupled', spurArea: 1, requireBoundaryTouch: true } },
+    { name: 'decoupled-boundary-spur2', v: { kind: 'decoupled', spurArea: 2, requireBoundaryTouch: true } },
+    { name: 'decoupled-boundary-spur4', v: { kind: 'decoupled', spurArea: 4, requireBoundaryTouch: true } }, // WINNER -- ported to production as SPUR_AREA_CAP
+    { name: 'decoupled-boundary-spur8', v: { kind: 'decoupled', spurArea: 8, requireBoundaryTouch: true } },
+    { name: 'decoupled-boundary-spur12', v: { kind: 'decoupled', spurArea: 12, requireBoundaryTouch: true } },
   ];
 
   const cases = {};
@@ -793,6 +998,63 @@ async function main() {
       const r = tickResults[name][`F${factor}`];
       const flag = r.deletedCount > 0 ? `  <-- ${r.deletedCount}/4 TICKS DELETED` : '';
       console.log(`  ${name.padEnd(24)} F${factor}: before=[${r.before.join(', ')}] after=[${r.after.join(', ')}] survival%=[${r.survivalPct.join(', ')}]${flag}`);
+    }
+  }
+
+  // small-dot-core: Gauge #35-review-round-2's regression case -- see
+  // coreHoleCheck's header for why this is a deterministic construction
+  // rather than a JPEG-degraded canvas source (organic reproduction of
+  // this exact vote pattern isn't reliable, same conclusion tickSurvival
+  // already reached). A cheap variant that carves the spurious interior
+  // hole shows up as pathCount HIGHER than the full-BFS reference (the
+  // hole renders as its own path/subpath, same instrument as aa-wordmark).
+  // NOTE on the comparison baseline: full-BFS despeckle operates at FINE
+  // resolution and therefore cleans up sub-native-pixel texture (like this
+  // construction's moat ring, which is inherently un-flattened by ANY
+  // native-resolution cheap variant including baseline-50pct -- untouched
+  // blocks always keep 100% of their raw fine content, moat texture
+  // included, a pre-existing #32-era tradeoff, not a #35 regression). That
+  // makes full-BFS pathCount a noisy reference for THIS specific
+  // comparison: baseline-50pct itself sits above it even with zero spur
+  // logic involved. The apples-to-apples reference for isolating the spur
+  // pass's OWN contribution is baseline-50pct on the SAME construction
+  // (identical moat texture, zero spur logic) -- any variant's pathCount
+  // above baseline's, for the SAME factor, is the spur pass's doing.
+  // full-BFS pathCount is still reported for context.
+  const dotResults = {};
+  for (const factor of [2, 4]) {
+    dotResults[`F${factor}`] = { variants: {} };
+    let fullBfsPathCount = null;
+    let baselinePathCount = null;
+    for (const { name, v } of VARIANTS) {
+      const r = await coreHoleCheck(page, factor, v, DESPECKLE_NATIVE, HOLE_NATIVE);
+      if (fullBfsPathCount === null) {
+        const fullPotrace = await runPotrace(page, r.fullDataUrl, { turdsize: 0, ...PRODUCTION_LIKE });
+        fullBfsPathCount = fullPotrace.paths.length;
+        dotResults[`F${factor}`].fullBfsPathCount = fullBfsPathCount;
+        dotResults[`F${factor}`].stdArea = r.stdArea;
+        dotResults[`F${factor}`].coreArea = r.coreArea;
+      }
+      const variantPotrace = await runPotrace(page, r.variantDataUrl, { turdsize: 0, ...PRODUCTION_LIKE });
+      if (name === 'baseline-50pct') baselinePathCount = variantPotrace.paths.length;
+      dotResults[`F${factor}`].variants[name] = {
+        pathCount: variantPotrace.paths.length,
+        blocksChanged: r.blocksChanged,
+        spurBlocksRemoved: r.spurBlocksRemoved,
+      };
+    }
+    dotResults[`F${factor}`].baselinePathCount = baselinePathCount;
+  }
+
+  console.log('\n=== SUMMARY: small-dot-core (interior-hole check, despeckleNative=' + DESPECKLE_NATIVE + ') ===');
+  for (const factor of [2, 4]) {
+    const r = dotResults[`F${factor}`];
+    console.log(`  F${factor}: stdArea=${r.stdArea} coreArea=${r.coreArea} full-BFS reference pathCount=${r.fullBfsPathCount}  baseline-50pct pathCount=${r.baselinePathCount}`);
+    for (const { name } of VARIANTS) {
+      const v = r.variants[name];
+      const flag = v.pathCount > r.baselinePathCount ? `  <-- ${v.pathCount - r.baselinePathCount} EXTRA PATH(S) VS BASELINE, LIKELY INTERIOR HOLE` : '';
+      const spur = v.spurBlocksRemoved !== undefined ? ` spurBlocksRemoved=${v.spurBlocksRemoved}` : '';
+      console.log(`    ${name.padEnd(24)} pathCount=${v.pathCount} blocksChanged=${v.blocksChanged}${spur}${flag}`);
     }
   }
 

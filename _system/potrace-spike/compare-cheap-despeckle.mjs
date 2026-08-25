@@ -190,9 +190,13 @@ function labelComponents(mask, width, height) {
 // strokes). Standard 50%-vote despeckle/hole-fill runs unchanged; a
 // separate read-only pass over a stricter 100%-vote view then strips only
 // components whose isolated area is tiny (<= SPUR_AREA_CAP, also capped by
-// despeckleNative) -- catching noise specks bridged onto real geometry
-// without touching real thin strokes. Validated at factor=2 only, do not
-// reuse at factor=4 without re-sweeping.
+// despeckleNative) AND that actually touch std-background somewhere
+// (excludes the fully-interior core of a small-but-legitimate shape, e.g.
+// a small dot/period -- a second review round found the size-only version
+// of this pass could carve a permanent interior hole into one; see
+// js/bilinear-worker.js's cheapDespeckle and
+// sweep-despeckle-threshold.mjs's small-dot-core case). Validated at
+// factor=2 only, do not reuse at factor=4 without re-sweeping.
 const SPUR_AREA_CAP = 4;
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
   const coarseStd = new Uint8Array(w * h);
@@ -218,9 +222,31 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
   const spurArea = despeckleNative > 0 ? Math.min(despeckleNative, SPUR_AREA_CAP) : 0;
   if (spurArea > 0) {
     const { labels, areas } = labelComponents(coarseStrict, w, h);
+    const touchesStdBackground = new Map();
+    for (let ny = 0; ny < h; ny++) {
+      for (let nx = 0; nx < w; nx++) {
+        const idx = ny * w + nx;
+        const id = labels[idx];
+        if (id === -1 || touchesStdBackground.get(id)) continue;
+        let touches = nx === 0 || ny === 0 || nx === w - 1 || ny === h - 1;
+        for (let dy = -1; dy <= 1 && !touches; dy++) {
+          for (let dx = -1; dx <= 1 && !touches; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const ny2 = ny + dy, nx2 = nx + dx;
+            if (ny2 < 0 || ny2 >= h || nx2 < 0 || nx2 >= w) continue;
+            if (cleaned[ny2 * w + nx2] === 0) touches = true;
+          }
+        }
+        if (touches) touchesStdBackground.set(id, true);
+        else if (!touchesStdBackground.has(id)) touchesStdBackground.set(id, false);
+      }
+    }
     for (let i = 0; i < cleaned.length; i++) {
       if (cleaned[i] !== 1 || coarseStrict[i] !== 1) continue;
-      if (areas.get(labels[i]) <= spurArea) cleaned[i] = 0;
+      const id = labels[i];
+      if (areas.get(id) > spurArea) continue;
+      if (!touchesStdBackground.get(id)) continue;
+      cleaned[i] = 0;
     }
   }
 

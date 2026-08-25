@@ -242,15 +242,45 @@ function labelComponents(mask, width, height) {
 // despeckle setting, including despeckleNative=0 meaning "off" for both
 // passes.
 //
+// Second-round fix (Gauge's pre-merge review of the size-only version
+// above): area alone can't distinguish a boundary-attached noise speck
+// (safe to zero) from the fully-saturated CORE of a small-but-legitimate
+// shape whose AA/JPEG-softened rim keeps its whole perimeter at
+// std-foreground (e.g. a small dot/period/serif tip) — that core is ALSO
+// a tiny isolated 100%-vote component, entirely interior, surrounded on
+// every side by std-foreground. Stripping it by size alone carves a
+// permanent interior hole, since this pass runs AFTER fillSmallHoles and
+// nothing re-fills afterward. Reproduced deterministically and confirmed
+// via _system/potrace-spike/sweep-despeckle-threshold.mjs's
+// small-dot-core case (a synthetic small solid disc with a tiny
+// fully-saturated central core, sized exactly like a real small dot under
+// this failure mode — see that function's header for why a JPEG-degraded
+// real-image construction couldn't reproduce it reliably, same reason
+// tickSurvival's header gives for the hairline-tick case).
+//
+// Fix: gate spur removal on BOUNDARY ADJACENCY, not size alone — a small
+// strict-view component is only removed if it actually touches
+// std-background somewhere (computed once per component via
+// touchesStdBackground below). A boundary-attached noise speck always
+// touches std-background on its far side (that's what makes it a spur,
+// not part of the shape); a shape's interior core, being interior, never
+// does. This is cheap (one more read-only pass over the native-resolution
+// grid, same cost class as labelComponents) and requires no change to the
+// aa-wordmark/hairline-tick behavior already validated above, since real
+// spurs stay boundary-attached under this check.
+//
 // Validated via _system/potrace-spike/sweep-despeckle-threshold.mjs
-// (decoupled-spur1..12 variants) at factor=2 (production's only value):
-// exactly matches full-BFS despeckle's path count on aa-wordmark (fixing
-// #35's original bug), stays bit-identical to the pre-#35 baseline on
-// noisy-logo, and keeps all 4 synthetic hairline ticks at 100% survival
-// across despeckleNative in {4, 24, 48} and spurArea in {1,2,4,8,12} — and
-// unlike the 100%-vote-only attempt, stays IDENTICAL to the pre-#35
-// baseline at factor=4 too (no factor=4 landmine). Do not raise
-// SPUR_AREA_CAP without re-running that sweep.
+// (decoupled-boundary-spur1..12 variants) at factor=2 (production's only
+// value): exactly matches full-BFS despeckle's path count on aa-wordmark
+// (fixing #35's original bug), stays bit-identical to the pre-#35 baseline
+// on noisy-logo, keeps all 4 synthetic hairline ticks at 100% survival
+// across despeckleNative in {4, 24, 48} and spurArea in {1,2,4,8,12},
+// stays IDENTICAL to the pre-#35 baseline at factor=4 (no factor=4
+// landmine) — AND, unlike the size-only version, leaves the small-dot-core
+// case's interior core untouched (matches baseline-50pct's path count
+// exactly), while the size-only version measurably carves the hole
+// (+1 path vs. baseline) on that same case. Do not raise SPUR_AREA_CAP or
+// drop the boundary-adjacency gate without re-running that sweep.
 const SPUR_AREA_CAP = 4;
 function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNative) {
   const coarseStd = new Uint8Array(w * h);
@@ -276,14 +306,39 @@ function cheapDespeckle(fineMask, ow, oh, factor, w, h, despeckleNative, holeNat
   let cleaned = removeSmallComponents(coarseStd, w, h, despeckleNative);
   cleaned = fillSmallHoles(cleaned, w, h, holeNative);
 
-  // Spur pass — strip only tiny isolated specks the standard pass's
-  // bridging blindness let slip through attached to legitimate shapes.
+  // Spur pass — strip only tiny isolated specks that (a) the standard
+  // pass's bridging blindness let slip through attached to legitimate
+  // shapes AND (b) actually touch std-background somewhere (excludes a
+  // small shape's fully-interior core — see header).
   const spurArea = despeckleNative > 0 ? Math.min(despeckleNative, SPUR_AREA_CAP) : 0;
   if (spurArea > 0) {
     const { labels, areas } = labelComponents(coarseStrict, w, h);
+    const touchesStdBackground = new Map();
+    for (let ny = 0; ny < h; ny++) {
+      for (let nx = 0; nx < w; nx++) {
+        const idx = ny * w + nx;
+        const id = labels[idx];
+        if (id === -1 || touchesStdBackground.get(id)) continue;
+        let touches = nx === 0 || ny === 0 || nx === w - 1 || ny === h - 1;
+        for (let dy = -1; dy <= 1 && !touches; dy++) {
+          for (let dx = -1; dx <= 1 && !touches; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const ny2 = ny + dy;
+            const nx2 = nx + dx;
+            if (ny2 < 0 || ny2 >= h || nx2 < 0 || nx2 >= w) continue;
+            if (cleaned[ny2 * w + nx2] === 0) touches = true;
+          }
+        }
+        if (touches) touchesStdBackground.set(id, true);
+        else if (!touchesStdBackground.has(id)) touchesStdBackground.set(id, false);
+      }
+    }
     for (let i = 0; i < cleaned.length; i++) {
       if (cleaned[i] !== 1 || coarseStrict[i] !== 1) continue;
-      if (areas.get(labels[i]) <= spurArea) cleaned[i] = 0;
+      const id = labels[i];
+      if (areas.get(id) > spurArea) continue;
+      if (!touchesStdBackground.get(id)) continue;
+      cleaned[i] = 0;
     }
   }
 
