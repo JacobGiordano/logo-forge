@@ -1100,6 +1100,7 @@ function onSelectDragEnd() {
       selectionBox = null;
     } else {
       clampPanToBox(selectionBox);
+      redrawSelectCanvasBackground();
     }
     selectConfirmBtn.disabled = !valid;
     updateSelectRectEl();
