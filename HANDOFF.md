@@ -1,10 +1,12 @@
-Last updated: 2026-08-25
+Last updated: 2026-10-23
 
 ## Status
 
 Issues #11-#34 complete and previously shipped. This cycle ships six issues together (#35-#40), all merged to local `main`, full Playwright suite green (52 tests; 1 pre-existing sandbox timing flake unrelated to any of this work — see Gotchas).
 
 ## Decisions made this session
+
+- 2026-10-23 tooling fix (no issue): added `npm start` (alias of `serve . -l 4321`) — `.vscode/tasks.json` "Dev Server" task runs `npm start` on folder open and was failing with "Missing script".
 
 - #35: closed the aa-wordmark stray-fragment regression in `cheapDespeckle` (`js/bilinear-worker.js`). Went through two iterations — an initial 100%-vote despeckle rule (a4e47c9) proved too aggressive on other content, replaced with a decoupled spur-removal pass (dd57733) gated on boundary adjacency rather than size alone (47fb7bd), plus a fixture correction (1de6cc1) to actually exercise the `spurArea=4` case it claimed to cover.
 - #36 (Scout): added Playwright coverage for the bilinear-2x path, the native-size fallback gate at `BILINEAR_NATIVE_SAFE_LIMIT`, the 3x/4x-removal regression guard, and Worker construction/timeout failure handling (`tests/bilinear.spec.ts`).
