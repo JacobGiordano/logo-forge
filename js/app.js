@@ -902,6 +902,7 @@ function isFormField(el) {
 }
 
 function clearSelectionBox() {
+  clearCenterLimitedStatus();
   selectionBox = null;
   dragOrigin = null;
   dragMode = null;
@@ -1161,6 +1162,11 @@ function onSelectDragEnd() {
   document.removeEventListener('touchmove', onSelectDrag);
   document.removeEventListener('touchend', onSelectDragEnd);
 
+  // Any drag that changes what the frame covers (#41) invalidates a
+  // "couldn't fully center" warning; view-pan/pinch only move the view and
+  // keep the box attached to the same source content, so they don't.
+  if (dragMode === 'new' || dragMode === 'resize' || dragMode === 'pan') clearCenterLimitedStatus();
+
   if (dragMode === 'new') {
     const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
     if (!valid) {
@@ -1261,11 +1267,43 @@ function centerSubjectInFrame() {
 
   const subjectCx = (minX + maxX + 1) / 2;
   const subjectCy = (minY + maxY + 1) / 2;
-  imagePanX += fw / 2 - subjectCx;
-  imagePanY += fh / 2 - subjectCy;
+  const wantDx = fw / 2 - subjectCx;
+  const wantDy = fh / 2 - subjectCy;
+  const panX0 = imagePanX;
+  const panY0 = imagePanY;
+  imagePanX += wantDx;
+  imagePanY += wantDy;
   clampPanToBox(selectionBox);
   redrawSelectCanvasBackground();
   updateSelectRectEl();
+
+  // #41: clampPanToBox can claw back part of the delta when the subject
+  // sits close to the source image's own edge — centering it would need
+  // the fixed-size frame to extend past the image. That's a hard geometric
+  // limit, not something a different pan/box split can work around (the
+  // clamp constrains the box *relative to the image*, which is exactly the
+  // same quantity centering changes), so say so instead of silently doing
+  // less than asked.
+  const residualX = wantDx - (imagePanX - panX0);
+  const residualY = wantDy - (imagePanY - panY0);
+  if (Math.abs(residualX) > CENTER_RESIDUAL_TOL_PX || Math.abs(residualY) > CENTER_RESIDUAL_TOL_PX) {
+    setStatus(CENTER_LIMITED_STATUS, 'warn');
+  } else {
+    clearCenterLimitedStatus();
+  }
+}
+
+// Status shown when Center (#41) can only partially center the subject.
+// Cleared (back to the normal selection-view status) by a later successful
+// Center or any change to the frame/framing, so it never outlives the
+// framing it describes.
+const CENTER_LIMITED_STATUS = "Couldn't fully center — the subject is too close to the image edge. Try a smaller selection.";
+const CENTER_RESIDUAL_TOL_PX = 1; // canvas-display px
+
+function clearCenterLimitedStatus() {
+  const el = document.getElementById('status');
+  if (el.textContent !== CENTER_LIMITED_STATUS) return;
+  setStatus(isTouchPrimary() ? SELECT_STATUS_TOUCH : SELECT_STATUS_DESKTOP);
 }
 
 // ── Auto-trim (#6) ────────────────────────────────────────────────────────
