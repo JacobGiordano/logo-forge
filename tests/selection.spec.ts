@@ -513,140 +513,260 @@ test.describe('selection UI — Center button (regression for #38)', () => {
   });
 });
 
-test.describe('selection UI — Center warns when it cannot fully center (#41)', () => {
-  // #41: centerSubjectInFrame() computes the pan delta that would center the
-  // detected subject, then clampPanToBox() can claw part of it back when the
-  // subject sits near the source image's own edge (the fixed frame would
-  // have to extend past the image). Before #41 that under-correction was
-  // silent. Now a residual > 1 canvas px shows CENTER_LIMITED_STATUS with
-  // class "warn", and any later change to what the frame covers (Clear, new
-  // box, box-pan, resize, a successful Center) restores the normal
-  // selection status. Zoom only moves the view, so it leaves the warning.
+test.describe('selection UI — Center pads past the image edge to truly center (#41)', () => {
+  // #41 (design: "allow padding"): when centering the subject would need the
+  // fixed-size frame to reach past the source image's edge, Center now
+  // grants exactly that much per-side padding (padAllowance, source px) and
+  // picks a fill for it (padFill): transparent if the source's edge strip is
+  // mostly transparent, else the median of the frame's non-subject pixels.
+  // Confirm/auto-trim crop through the padding; Edit crop round-trips it;
+  // every other framing change can only shrink it; Clear / a new box / a new
+  // upload reset it. Before this, clampPanToBox silently under-corrected.
   //
-  // Geometry at 100% zoom (SHEET_FIXTURE, 260px canvas, scale 260/512): the
-  // square icon spans canvas ~20..102. A box 8..140 puts the subject center
-  // ~13px left of the frame center, but pan can't exceed box.x (8) without
-  // uncovering the frame — so Center can only move ~8 of the needed ~13px.
-  const CENTER_LIMITED = "Couldn't fully center — the subject is too close to the image edge. Try a smaller selection.";
-  const NORMAL_STATUS = /^Drag to select a region, then confirm/;
+  // Geometry at 100% zoom (SHEET_FIXTURE: 512px sheet on a 260px canvas,
+  // scale 260/512): the square icon is source 40..200 (center 120). A box
+  // drawn 8..140 display maps to ~260 source px starting at ~16 — so
+  // centering the square in it puts the frame's left/top edge ~12-13 source
+  // px *past* the image's left/top edge.
+  const PAD_BOX: [number, number, number, number] = [8, 8, 140, 140];
 
-  async function showCenterWarning(page: Page) {
-    await dragOnCanvas(page, 8, 8, 140, 140);
-    await expect(page.locator('#select-rect')).toBeVisible();
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-    await page.locator('#select-center-btn').click();
-    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
-    await expect(page.locator('#status')).toHaveClass('warn');
+  const state = (page: Page) => page.evaluate(() => ({
+    src: selectionBox ? selectionRectToSourceRect(selectionBox) : null,
+    box: selectionBox ? { ...selectionBox } : null,
+    // typeof guards: these globals only exist since #41's padding change;
+    // reading them defensively keeps this helper usable against older builds.
+    pad: typeof padAllowance === 'undefined' ? { l: 0, r: 0, t: 0, b: 0 } : { ...padAllowance },
+    fill: typeof padFill === 'undefined' || !padFill ? null : { ...padFill },
+    panX: imagePanX,
+    canvasW: (document.getElementById('select-canvas') as HTMLCanvasElement).width,
+    canvasH: (document.getElementById('select-canvas') as HTMLCanvasElement).height,
+  }));
+
+  async function setAutoTrim(page: Page, on: boolean) {
+    const btn = page.locator('#select-autotrim-btn');
+    if ((await btn.getAttribute('aria-pressed')) !== String(on)) await btn.click();
+    await expect(btn).toHaveAttribute('aria-pressed', String(on));
   }
 
-  // Bounding box (frame-local, canvas px) of dark subject pixels inside the
-  // current selection frame, read from the rendered canvas.
-  async function subjectBoundsInFrame(page: Page) {
-    return page.evaluate(() => {
-      const el = document.getElementById('select-canvas') as HTMLCanvasElement;
-      const r = document.getElementById('select-rect')!.getBoundingClientRect();
-      const c = el.getBoundingClientRect();
-      const fx = Math.round(r.left - c.left), fy = Math.round(r.top - c.top);
-      const fw = Math.round(r.width), fh = Math.round(r.height);
-      const d = el.getContext('2d')!.getImageData(fx, fy, fw, fh).data;
-      let minX = fw, minY = fh, maxX = -1, maxY = -1;
-      for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
-        const i = (y * fw + x) * 4;
-        if (d[i + 3] === 255 && d[i] < 128) {
-          if (x < minX) minX = x; if (x > maxX) maxX = x;
-          if (y < minY) minY = y; if (y > maxY) maxY = y;
-        }
-      }
-      return { fw, fh, minX, minY, maxX, maxY };
+  async function confirmAndReadCrop(page: Page) {
+    await page.locator('#select-confirm-btn').click();
+    await expect(page.locator('#thumb-wrap')).toBeVisible();
+    return page.locator('#thumb-img').evaluate(async (img: HTMLImageElement) => {
+      await img.decode();
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const px = (x: number, y: number) => Array.from(ctx.getImageData(x, y, 1, 1).data);
+      const w = c.width, h = c.height;
+      return {
+        w, h,
+        corners: [px(0, 0), px(w - 1, 0), px(0, h - 1), px(w - 1, h - 1)],
+        rect: { ...lastCropRect },
+        fill: typeof lastCropFill === 'undefined' || !lastCropFill ? null : { ...lastCropFill },
+      };
     });
   }
 
-  test.beforeEach(async ({ page }) => {
-    await uploadSheet(page);
-    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
-  });
+  async function canvasPixel(page: Page, x: number, y: number) {
+    return page.evaluate(({ x, y }) => {
+      const el = document.getElementById('select-canvas') as HTMLCanvasElement;
+      return Array.from(el.getContext('2d')!.getImageData(Math.round(x), Math.round(y), 1, 1).data);
+    }, { x, y });
+  }
 
-  test('Center shows a warn status when the clamp prevents full centering, and pan is pinned at the frame edge', async ({ page }) => {
-    await showCenterWarning(page);
+  // Builds a 512x512 PNG with SHEET_FIXTURE's layout (square 40..200,
+  // circle at 380,380 r90) in arbitrary colors, in-browser, and uploads it.
+  async function uploadGeneratedSheet(page: Page, bg: string | null, fg: string) {
+    await page.goto('/');
+    const b64 = await page.evaluate(({ bg, fg }) => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 512;
+      const ctx = c.getContext('2d')!;
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, 512, 512); }
+      ctx.fillStyle = fg;
+      ctx.fillRect(40, 40, 160, 160);
+      ctx.beginPath(); ctx.arc(380, 380, 90, 0, Math.PI * 2); ctx.fill();
+      return c.toDataURL('image/png').split(',')[1];
+    }, { bg, fg });
+    await page.locator('#file-input').setInputFiles({
+      name: 'generated-sheet.png', mimeType: 'image/png', buffer: Buffer.from(b64, 'base64'),
+    });
+    await expect(page.locator('#select-wrap')).toBeVisible({ timeout: 3000 });
+  }
 
-    // The pan was clamped to its limit: image's left/top edge flush with
-    // the frame's left/top edge.
-    const s = await page.evaluate(() => ({ panX: imagePanX, panY: imagePanY, box: { ...selectionBox } }));
-    expect(Math.abs(s.panX - s.box.x)).toBeLessThan(0.5);
-    expect(Math.abs(s.panY - s.box.y)).toBeLessThan(0.5);
-
-    // The subject really is still off-center (left/top heavy) — the warning
-    // describes the actual framing, it isn't spurious.
-    const b = await subjectBoundsInFrame(page);
-    expect(b.maxX).toBeGreaterThan(b.minX);
-    const leftGap = b.minX, rightGap = b.fw - 1 - b.maxX;
-    expect(rightGap - leftGap).toBeGreaterThan(2);
-
-    // Pressing Center again can't do any better, so the warning stays.
+  async function drawPadBoxAndCenter(page: Page) {
+    await dragOnCanvas(page, ...PAD_BOX);
+    await expect(page.locator('#select-rect')).toBeVisible();
     await page.locator('#select-center-btn').click();
-    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
-    await expect(page.locator('#status')).toHaveClass('warn');
+  }
+
+  test.describe('on the white sheet fixture', () => {
+    test.beforeEach(async ({ page }) => {
+      await uploadSheet(page);
+      await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+    });
+
+    test('Center near the image edge truly centers the subject by granting padding (no warning)', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const s = await state(page);
+      expect(Math.abs(s.src!.sx - -12)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sy - -13)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sw - 263)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sh - 263)).toBeLessThanOrEqual(1);
+      // The square icon (source center 120,120) sits at the frame center.
+      // Center measures in whole display px (the frame origin is rounded),
+      // and one display px is ~2 source px here, so allow 1.5 source px.
+      expect(Math.abs(s.src!.sx + s.src!.sw / 2 - 120)).toBeLessThanOrEqual(1.5);
+      expect(Math.abs(s.src!.sy + s.src!.sh / 2 - 120)).toBeLessThanOrEqual(1.5);
+      expect(s.pad.l).toBeGreaterThan(0);
+      expect(s.pad.t).toBeGreaterThan(0);
+      expect(s.pad.r).toBe(0);
+      expect(s.pad.b).toBe(0);
+      await expect(page.locator('#status')).not.toHaveClass('warn');
+      await expect(page.locator('#status')).toHaveText(/^Drag to select a region, then confirm/);
+    });
+
+    test('the preview draws the padded strip inside the frame in the fill color', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const s = await state(page);
+      // The image's left edge now sits inside the frame, leaving a padded
+      // strip between the frame edge and the image.
+      expect(s.panX).toBeGreaterThan(s.box!.x + 3);
+      expect(s.fill).toEqual({ r: 255, g: 255, b: 255, a: 255 });
+      const p = await canvasPixel(page, s.box!.x + 1, 60);
+      expect(p).toEqual([255, 255, 255, 255]);
+    });
+
+    test('confirming a padded frame (auto-trim off) crops through the padding with the fill', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+      expect(Math.abs(crop.w - 263)).toBeLessThanOrEqual(1);
+      expect(Math.abs(crop.h - 263)).toBeLessThanOrEqual(1);
+      for (const c of crop.corners) expect(c).toEqual([255, 255, 255, 255]);
+      expect(Math.abs(crop.rect.sx - -12)).toBeLessThanOrEqual(1);
+      expect(crop.rect.sx).toBeLessThan(0);
+      expect(crop.fill?.a).toBe(255);
+    });
+
+    test('confirming a padded frame with auto-trim on trims to the subject and needs no fill', async ({ page }) => {
+      await setAutoTrim(page, true);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+      expect(crop.w).toBe(164);
+      expect(crop.h).toBe(164);
+      expect(crop.rect.sx).toBe(38);
+      expect(crop.rect.sy).toBe(38);
+      expect(crop.fill).toBeNull();
+    });
+
+    test('Edit crop on a padded crop reopens with the same rect, its padding, and the box on-canvas', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+
+      await page.locator('#edit-crop-btn').click();
+      await expect(page.locator('#select-wrap')).toBeVisible();
+      const s = await state(page);
+      expect(s.src).toEqual(crop.rect);
+      expect(s.pad).toEqual({ l: -crop.rect.sx, t: -crop.rect.sy, r: 0, b: 0 });
+      expect(s.fill).toEqual(crop.fill);
+      expect(s.box!.x).toBeGreaterThanOrEqual(-0.5);
+      expect(s.box!.y).toBeGreaterThanOrEqual(-0.5);
+      expect(s.box!.x + s.box!.w).toBeLessThanOrEqual(s.canvasW + 0.5);
+      expect(s.box!.y + s.box!.h).toBeLessThanOrEqual(s.canvasH + 0.5);
+    });
+
+    test('padding is shrink-only: pan-dragging after Center never grows it back', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const p0 = (await state(page)).pad;
+      expect(p0.l).toBeGreaterThan(0);
+      expect(p0.t).toBeGreaterThan(0);
+
+      // Image moves left/up 10/5 display px (~20/10 source px): the left
+      // padding is no longer needed at all, the top partly.
+      await dragOnCanvas(page, 100, 100, 90, 95);
+      const p1 = (await state(page)).pad;
+      for (const k of ['l', 'r', 't', 'b'] as const) expect(p1[k]).toBeLessThanOrEqual(p0[k]);
+      expect(p1.l).toBe(0);
+      // Shrunk to what the box still needs, not reset outright.
+      expect(p1.t).toBeGreaterThan(0);
+      expect(p1.t).toBeLessThan(p0.t);
+
+      // Dragging the image back right/down would need more padding than is
+      // left — it must clamp instead of re-granting it.
+      await dragOnCanvas(page, 90, 95, 130, 130);
+      const s2 = await state(page);
+      for (const k of ['l', 'r', 't', 'b'] as const) expect(s2.pad[k]).toBeLessThanOrEqual(p1[k]);
+      expect(s2.pad.l).toBe(0);
+      expect(s2.src!.sx).toBeGreaterThanOrEqual(0);
+      expect(s2.src!.sy).toBeGreaterThanOrEqual(-Math.ceil(p1.t));
+    });
+
+    for (const [name, act] of [
+      ['Clear', async (page: Page) => { await page.locator('#select-clear-btn').click(); }],
+      ['a new box drag', async (page: Page) => { await dragOnCanvas(page, 160, 160, 250, 250); }],
+      ['a re-upload via #file-input2', async (page: Page) => {
+        await page.locator('#file-input2').setInputFiles(SHEET_FIXTURE);
+        await expect(page.locator('#select-wrap')).toBeVisible();
+      }],
+    ] as const) {
+      test(`${name} after a padded Center resets the padding`, async ({ page }) => {
+        await drawPadBoxAndCenter(page);
+        expect((await state(page)).fill).not.toBeNull();
+        await act(page);
+        const s = await state(page);
+        expect(s.pad).toEqual({ l: 0, r: 0, t: 0, b: 0 });
+        expect(s.fill).toBeNull();
+      });
+    }
+
+    test('a frame that needs no padding still confirms to the plain in-image crop', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await dragOnCanvas(page, 125, 125, 250, 250); // around the circle, clear of the edges
+      await page.locator('#select-center-btn').click();
+      const s = await state(page);
+      expect(s.pad).toEqual({ l: 0, r: 0, t: 0, b: 0 });
+      expect(s.fill).toBeNull();
+      const crop = await confirmAndReadCrop(page);
+      expect(crop.rect.sx).toBeGreaterThanOrEqual(0);
+      expect(crop.rect.sy).toBeGreaterThanOrEqual(0);
+      expect(crop.rect.sx + crop.rect.sw).toBeLessThanOrEqual(512);
+      expect(crop.rect.sy + crop.rect.sh).toBeLessThanOrEqual(512);
+      expect([crop.w, crop.h]).toEqual([crop.rect.sw, crop.rect.sh]);
+      expect(crop.fill).toBeNull();
+    });
   });
 
-  test('Center that fully succeeds shows no warning and centers the subject in the frame', async ({ page }) => {
-    await dragOnCanvas(page, 125, 125, 250, 250); // around the circle icon
-    await page.locator('#select-center-btn').click();
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-    await expect(page.locator('#status')).not.toHaveClass('warn');
-
-    const b = await subjectBoundsInFrame(page);
-    expect(b.maxX).toBeGreaterThan(b.minX);
-    const cx = (b.minX + b.maxX + 1) / 2, cy = (b.minY + b.maxY + 1) / 2;
-    expect(Math.abs(cx - b.fw / 2)).toBeLessThanOrEqual(1.5);
-    expect(Math.abs(cy - b.fh / 2)).toBeLessThanOrEqual(1.5);
+  test('on a dark background, padding is filled with the background color', async ({ page }) => {
+    await uploadGeneratedSheet(page, '#101010', '#ffffff');
+    await setAutoTrim(page, false);
+    await drawPadBoxAndCenter(page);
+    const s = await state(page);
+    expect(s.pad.l).toBeGreaterThan(0);
+    expect(s.fill).toEqual({ r: 16, g: 16, b: 16, a: 255 });
+    expect(await canvasPixel(page, s.box!.x + 1, 60)).toEqual([16, 16, 16, 255]);
+    const crop = await confirmAndReadCrop(page);
+    expect(crop.rect.sx).toBeLessThan(0);
+    for (const c of crop.corners) expect(c).toEqual([16, 16, 16, 255]);
   });
 
-  test('Clear restores the normal selection status', async ({ page }) => {
-    await showCenterWarning(page);
-    await page.locator('#select-clear-btn').click();
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-    await expect(page.locator('#status')).not.toHaveClass('warn');
-  });
-
-  test('drawing a new box restores the normal selection status', async ({ page }) => {
-    await showCenterWarning(page);
-    await dragOnCanvas(page, 160, 160, 250, 250); // starts outside the old box
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-    await expect(page.locator('#status')).not.toHaveClass('warn');
-  });
-
-  test('pan-dragging inside the box restores the normal selection status', async ({ page }) => {
-    await showCenterWarning(page);
-    const before = await page.evaluate(() => ({ ...selectionBox }));
-    await dragOnCanvas(page, 74, 74, 60, 60); // well away from any corner handle
-    // Still the same frame (a pan, not a new box or resize).
-    const after = await page.evaluate(() => ({ ...selectionBox }));
-    expect(after).toEqual(before);
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-  });
-
-  test('resizing the box from a corner handle restores the normal selection status', async ({ page }) => {
-    await showCenterWarning(page);
-    const before = await page.locator('#select-rect').boundingBox();
-    await dragOnCanvas(page, 140, 140, 170, 170);
-    const after = await page.locator('#select-rect').boundingBox();
-    expect(after!.width).toBeGreaterThan(before!.width + 10);
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-  });
-
-  test('zooming leaves the warning up; a subsequent successful Center clears it', async ({ page }) => {
-    await showCenterWarning(page);
-
-    await page.locator('#select-zoom-in-btn').click();
-    await expect(page.locator('#select-zoom-readout')).toHaveText('150%');
-    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
-    await expect(page.locator('#status')).toHaveClass('warn');
-
-    // At 150% the subject sits far enough from the image edge (in canvas
-    // px) that the same frame can be centered on it without clamping.
-    await page.locator('#select-center-btn').click();
-    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
-    await expect(page.locator('#status')).not.toHaveClass('warn');
+  test('on a transparent background, padding stays transparent and previews as a checker', async ({ page }) => {
+    await uploadGeneratedSheet(page, null, '#000000');
+    await setAutoTrim(page, false);
+    await drawPadBoxAndCenter(page);
+    const s = await state(page);
+    expect(s.pad.l).toBeGreaterThan(0);
+    expect(s.fill?.a).toBe(0);
+    // Preview: the padded strip shows one of the checker's two opaque tones
+    // (#3a3a40 / #2b2b30), not empty canvas.
+    const p = await canvasPixel(page, s.box!.x + 1, 60);
+    expect(p[3]).toBe(255);
+    expect([[58, 58, 64, 255], [43, 43, 48, 255]]).toContainEqual(p);
+    const crop = await confirmAndReadCrop(page);
+    expect(crop.rect.sx).toBeLessThan(0);
+    for (const c of crop.corners) expect(c[3]).toBe(0);
   });
 });
 
