@@ -479,7 +479,18 @@ const SELECT_SKIP_MAX_DIM = 256;
 const MAX_UPLOAD_DIM = 6000;
 
 function handleFile(file) {
-  if (!file || !file.type.startsWith('image/')) return;
+  // No file at all (e.g. a drop of plain text/links) — nothing to report.
+  if (!file) return;
+  // A non-image file can now arrive via drag-and-drop (the pickers'
+  // accept="image/*" used to hide this). Report it the same way as the
+  // MAX_UPLOAD_DIM rejection and leave the current image/state untouched.
+  if (!file.type || !file.type.startsWith('image/')) {
+    setStatus(
+      'Not an image: "' + file.name + '" — please drop a PNG or JPG file.',
+      'err'
+    );
+    return;
+  }
   // Kick off the potrace-wasm module load opportunistically here rather
   // than on page load, so a cold wasm compile never sits on the critical
   // path of the very first trace — by the time the user finishes tuning
