@@ -2,20 +2,20 @@ Last updated: 2026-10-23
 
 ## Status
 
-Issues #11-#40 complete and shipped. This ship adds drop-to-replace (no issue number): dragging an image file anywhere over the app replaces the loaded image instead of the browser opening it in a new tab. Suite: 51 passed, 1 known flake (see Gotchas).
+Issues #11-#40 and #33 complete and shipped, plus drop-to-replace (no issue) and a non-image drop error message (no issue). Suite: 80 passed, 1 known flake (see Gotchas).
 
 ## Decisions made this session
 
 - Drop-to-replace: `#dropzone` is hidden after load, so its drop handlers stopped firing and the browser default took over. Moved file-drop handling to window-level dragenter/dragover/dragleave/drop (only for drags carrying `'Files'`), all routed through `handleFile` — single code path; `#dropzone` handlers now only toggle its highlight.
 - In-page drags (e.g. the `<img>` thumbnail, which Chrome reports as `'Files'`) are ignored via a document-level `dragstart` flag.
 - `#drop-overlay` ("Drop to replace image") shows only once an image is loaded; `pointer-events:none`, depth-counter to avoid flicker. Needs explicit `#drop-overlay[hidden]{display:none}` because its `display:flex` otherwise beats `[hidden]`.
+- Non-image drop: `handleFile` now rejects non-image (or empty-type) files up front with `setStatus('Not an image: "<name>" — please drop a PNG or JPG file.', 'err')`, matching #37's oversize error; no state touched. No-file drops still return silently.
+- #33 (Scout): `tests/tooltips.spec.ts` (16 tests, incl. #28 hover-scope regression + path-simplify copy/behavior guard); `tests/drop-replace.spec.ts` (13 tests) covers drop-to-replace.
 - State on replace is identical to the replace-file input (by construction): clears remembered crop only; undo history, Levels, settings, and trace output persist — pre-existing behavior, left as-is.
 
 ## Next issues
 
-- #33 (Scout): Playwright coverage for the #26/#28 tooltip/popover feature — still open.
-- Scout: regression test for drop-to-replace (scratch harness used for manual verification, not in `tests/`).
-- Possible: `handleFile` silently ignores dropped non-image files (file pickers' `accept="image/*"` used to hide this) — consider a user-facing message.
+- Scout: `playwright.config.ts` hardcodes port 4321 with `reuseExistingServer: true` — parallel worktree test runs share one server and test each other's code. Needs per-worktree port or no reuse before the next parallel dispatch.
 - Color-aware tracing: on hold per user request.
 - Possible future: `touchcancel` handling for pinch/pan (flagged in #23, not urgent).
 
