@@ -85,7 +85,7 @@ async function traceAndExpectStatus(page: Page, text: string, cls: string, timeo
 // two large fixtures below pin an EXACT native pixel size (3499 vs 3500)
 // rather than an approximate one.
 async function uploadFullCanvasSelection(page: Page, fixture: string) {
-  await page.goto('http://localhost:4321');
+  await page.goto('/');
   await page.locator('#file-input').setInputFiles(fixture);
   await expect(page.locator('#select-wrap')).toBeVisible({ timeout: 5000 });
 
@@ -257,7 +257,7 @@ test.describe('native-resolution fallback at BILINEAR_NATIVE_SAFE_LIMIT (issue #
 
 test.describe('3x/4x upscale options regression guard (issue #34)', () => {
   test('the upscale-factor control only offers Off/2x -- 3x and 4x never reappear', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
 
     const options = page.locator('#upscale-factor option');
     await expect(options).toHaveCount(2);

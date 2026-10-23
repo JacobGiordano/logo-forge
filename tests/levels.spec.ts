@@ -56,7 +56,7 @@ async function setNumericSlider(page: Page, id: string, value: string) {
 
 test.describe('Levels controls render with correct defaults (issue #40)', () => {
   test('black point, white point, and gamma sliders have correct default value/min/max/step', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
 
     await expect(page.locator('#levels-black')).toHaveValue('0');
     await expect(page.locator('#levels-black')).toHaveAttribute('min', '0');
@@ -80,7 +80,7 @@ test.describe('Levels controls render with correct defaults (issue #40)', () => 
 
 test.describe('each Levels control measurably changes the traced output (issue #40)', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(GRADIENT_FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     // Fixed manual threshold -- see header comment for why auto/Otsu would
@@ -155,7 +155,7 @@ test.describe('each Levels control measurably changes the traced output (issue #
 
 test.describe('undo/redo round-trips a Levels change (issue #40)', () => {
   async function uploadAndTrace(page: Page) {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     await page.locator('#trace-btn').click();
@@ -185,7 +185,7 @@ test.describe('undo/redo round-trips a Levels change (issue #40)', () => {
 
 test.describe('Levels sliders participate in the live-preview debounce (issue #40)', () => {
   test('rapid successive changes to levels-white coalesce into exactly one retrace after the debounce window', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     await page.locator('#trace-btn').click(); // history entry #1

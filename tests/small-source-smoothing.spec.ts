@@ -50,7 +50,7 @@ const SMALL_FIXTURE = path.resolve(__dirname, 'fixtures/thin-strokes-small.png')
 const NORMAL_FIXTURE = path.resolve(__dirname, 'fixtures/thin-strokes-normal.png');
 
 async function traceAndReadMaskPixels(page: Page, fixture: string, points: [number, number][]) {
-  await page.goto('http://localhost:4321');
+  await page.goto('/');
   await page.locator('#file-input').setInputFiles(fixture);
   await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
   // Default settings throughout -- no sliders touched. cornerSmoothing
@@ -103,7 +103,7 @@ test.describe('small-source stroke survival and gap separation (issue #39)', () 
   });
 
   test('the SVG itself reflects real, non-empty traced content at this size (not an empty result)', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(SMALL_FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     await page.locator('#trace-btn').click();

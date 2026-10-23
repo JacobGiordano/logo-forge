@@ -36,7 +36,7 @@ const AA_SHEET_FIXTURE = path.resolve(__dirname, 'fixtures/select-sheet-aa.png')
 const SMALL_FIXTURE = path.resolve(__dirname, 'fixtures/test-logo.png');
 
 async function uploadSheet(page: Page, fixture = SHEET_FIXTURE) {
-  await page.goto('http://localhost:4321');
+  await page.goto('/');
   await page.locator('#file-input').setInputFiles(fixture);
   await expect(page.locator('#select-wrap')).toBeVisible({ timeout: 3000 });
 }
@@ -85,7 +85,7 @@ test.describe('selection UI — threshold gating', () => {
   });
 
   test('images at or below the 256px threshold skip the selection view entirely', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(SMALL_FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     await expect(page.locator('#select-wrap')).toBeHidden();
