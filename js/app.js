@@ -979,6 +979,7 @@ function startPinch(e) {
   dragMode = 'touch-pinch';
   document.addEventListener('touchmove', onSelectDrag, { passive: false });
   document.addEventListener('touchend', onSelectDragEnd);
+  document.addEventListener('touchcancel', onSelectDragEnd);
 }
 
 // Which corner handle (if any) a canvas point is within tolerance of.
@@ -1061,6 +1062,7 @@ function onSelectDragStart(e) {
     document.addEventListener('mouseup', onSelectDragEnd);
     document.addEventListener('touchmove', onSelectDrag, { passive: false });
     document.addEventListener('touchend', onSelectDragEnd);
+    document.addEventListener('touchcancel', onSelectDragEnd);
     return;
   }
 
@@ -1088,6 +1090,7 @@ function onSelectDragStart(e) {
   document.addEventListener('mouseup', onSelectDragEnd);
   document.addEventListener('touchmove', onSelectDrag, { passive: false });
   document.addEventListener('touchend', onSelectDragEnd);
+  document.addEventListener('touchcancel', onSelectDragEnd);
 }
 
 selectCanvas.addEventListener('mousedown', onSelectDragStart);
@@ -1156,11 +1159,16 @@ function onSelectDrag(e) {
   updateSelectRectEl();
 }
 
+// Also bound to touchcancel: when the browser aborts a touch (system
+// gesture, alert, palm rejection) no touchend follows, so without it the
+// document-level listeners and drag/pinch state below would stay live and
+// the next touch would continue a stale gesture.
 function onSelectDragEnd() {
   document.removeEventListener('mousemove', onSelectDrag);
   document.removeEventListener('mouseup', onSelectDragEnd);
   document.removeEventListener('touchmove', onSelectDrag);
   document.removeEventListener('touchend', onSelectDragEnd);
+  document.removeEventListener('touchcancel', onSelectDragEnd);
 
   // Any drag that changes what the frame covers (#41) invalidates a
   // "couldn't fully center" warning; view-pan/pinch only move the view and
