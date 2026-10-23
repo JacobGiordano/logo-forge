@@ -513,6 +513,143 @@ test.describe('selection UI — Center button (regression for #38)', () => {
   });
 });
 
+test.describe('selection UI — Center warns when it cannot fully center (#41)', () => {
+  // #41: centerSubjectInFrame() computes the pan delta that would center the
+  // detected subject, then clampPanToBox() can claw part of it back when the
+  // subject sits near the source image's own edge (the fixed frame would
+  // have to extend past the image). Before #41 that under-correction was
+  // silent. Now a residual > 1 canvas px shows CENTER_LIMITED_STATUS with
+  // class "warn", and any later change to what the frame covers (Clear, new
+  // box, box-pan, resize, a successful Center) restores the normal
+  // selection status. Zoom only moves the view, so it leaves the warning.
+  //
+  // Geometry at 100% zoom (SHEET_FIXTURE, 260px canvas, scale 260/512): the
+  // square icon spans canvas ~20..102. A box 8..140 puts the subject center
+  // ~13px left of the frame center, but pan can't exceed box.x (8) without
+  // uncovering the frame — so Center can only move ~8 of the needed ~13px.
+  const CENTER_LIMITED = "Couldn't fully center — the subject is too close to the image edge. Try a smaller selection.";
+  const NORMAL_STATUS = /^Drag to select a region, then confirm/;
+
+  async function showCenterWarning(page: Page) {
+    await dragOnCanvas(page, 8, 8, 140, 140);
+    await expect(page.locator('#select-rect')).toBeVisible();
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+    await page.locator('#select-center-btn').click();
+    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
+    await expect(page.locator('#status')).toHaveClass('warn');
+  }
+
+  // Bounding box (frame-local, canvas px) of dark subject pixels inside the
+  // current selection frame, read from the rendered canvas.
+  async function subjectBoundsInFrame(page: Page) {
+    return page.evaluate(() => {
+      const el = document.getElementById('select-canvas') as HTMLCanvasElement;
+      const r = document.getElementById('select-rect')!.getBoundingClientRect();
+      const c = el.getBoundingClientRect();
+      const fx = Math.round(r.left - c.left), fy = Math.round(r.top - c.top);
+      const fw = Math.round(r.width), fh = Math.round(r.height);
+      const d = el.getContext('2d')!.getImageData(fx, fy, fw, fh).data;
+      let minX = fw, minY = fh, maxX = -1, maxY = -1;
+      for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
+        const i = (y * fw + x) * 4;
+        if (d[i + 3] === 255 && d[i] < 128) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+      return { fw, fh, minX, minY, maxX, maxY };
+    });
+  }
+
+  test.beforeEach(async ({ page }) => {
+    await uploadSheet(page);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+  });
+
+  test('Center shows a warn status when the clamp prevents full centering, and pan is pinned at the frame edge', async ({ page }) => {
+    await showCenterWarning(page);
+
+    // The pan was clamped to its limit: image's left/top edge flush with
+    // the frame's left/top edge.
+    const s = await page.evaluate(() => ({ panX: imagePanX, panY: imagePanY, box: { ...selectionBox } }));
+    expect(Math.abs(s.panX - s.box.x)).toBeLessThan(0.5);
+    expect(Math.abs(s.panY - s.box.y)).toBeLessThan(0.5);
+
+    // The subject really is still off-center (left/top heavy) — the warning
+    // describes the actual framing, it isn't spurious.
+    const b = await subjectBoundsInFrame(page);
+    expect(b.maxX).toBeGreaterThan(b.minX);
+    const leftGap = b.minX, rightGap = b.fw - 1 - b.maxX;
+    expect(rightGap - leftGap).toBeGreaterThan(2);
+
+    // Pressing Center again can't do any better, so the warning stays.
+    await page.locator('#select-center-btn').click();
+    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
+    await expect(page.locator('#status')).toHaveClass('warn');
+  });
+
+  test('Center that fully succeeds shows no warning and centers the subject in the frame', async ({ page }) => {
+    await dragOnCanvas(page, 125, 125, 250, 250); // around the circle icon
+    await page.locator('#select-center-btn').click();
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+    await expect(page.locator('#status')).not.toHaveClass('warn');
+
+    const b = await subjectBoundsInFrame(page);
+    expect(b.maxX).toBeGreaterThan(b.minX);
+    const cx = (b.minX + b.maxX + 1) / 2, cy = (b.minY + b.maxY + 1) / 2;
+    expect(Math.abs(cx - b.fw / 2)).toBeLessThanOrEqual(1.5);
+    expect(Math.abs(cy - b.fh / 2)).toBeLessThanOrEqual(1.5);
+  });
+
+  test('Clear restores the normal selection status', async ({ page }) => {
+    await showCenterWarning(page);
+    await page.locator('#select-clear-btn').click();
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+    await expect(page.locator('#status')).not.toHaveClass('warn');
+  });
+
+  test('drawing a new box restores the normal selection status', async ({ page }) => {
+    await showCenterWarning(page);
+    await dragOnCanvas(page, 160, 160, 250, 250); // starts outside the old box
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+    await expect(page.locator('#status')).not.toHaveClass('warn');
+  });
+
+  test('pan-dragging inside the box restores the normal selection status', async ({ page }) => {
+    await showCenterWarning(page);
+    const before = await page.evaluate(() => ({ ...selectionBox }));
+    await dragOnCanvas(page, 74, 74, 60, 60); // well away from any corner handle
+    // Still the same frame (a pan, not a new box or resize).
+    const after = await page.evaluate(() => ({ ...selectionBox }));
+    expect(after).toEqual(before);
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+  });
+
+  test('resizing the box from a corner handle restores the normal selection status', async ({ page }) => {
+    await showCenterWarning(page);
+    const before = await page.locator('#select-rect').boundingBox();
+    await dragOnCanvas(page, 140, 140, 170, 170);
+    const after = await page.locator('#select-rect').boundingBox();
+    expect(after!.width).toBeGreaterThan(before!.width + 10);
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+  });
+
+  test('zooming leaves the warning up; a subsequent successful Center clears it', async ({ page }) => {
+    await showCenterWarning(page);
+
+    await page.locator('#select-zoom-in-btn').click();
+    await expect(page.locator('#select-zoom-readout')).toHaveText('150%');
+    await expect(page.locator('#status')).toHaveText(CENTER_LIMITED);
+    await expect(page.locator('#status')).toHaveClass('warn');
+
+    // At 150% the subject sits far enough from the image edge (in canvas
+    // px) that the same frame can be centered on it without clamping.
+    await page.locator('#select-center-btn').click();
+    await expect(page.locator('#status')).toHaveText(NORMAL_STATUS);
+    await expect(page.locator('#status')).not.toHaveClass('warn');
+  });
+});
+
 test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-finger pan)', () => {
   test.use({ hasTouch: true });
 
