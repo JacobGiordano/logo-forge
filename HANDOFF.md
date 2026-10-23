@@ -2,29 +2,27 @@ Last updated: 2026-10-23
 
 ## Status
 
-Issues #11-#34 complete and previously shipped. This cycle ships six issues together (#35-#40), all merged to local `main`, full Playwright suite green (52 tests; 1 pre-existing sandbox timing flake unrelated to any of this work — see Gotchas).
+Issues #11-#40 complete and shipped. This ship adds drop-to-replace (no issue number): dragging an image file anywhere over the app replaces the loaded image instead of the browser opening it in a new tab. Suite: 51 passed, 1 known flake (see Gotchas).
 
 ## Decisions made this session
 
-- 2026-10-23 tooling fix (no issue): added `npm start` (alias of `serve . -l 4321`) — `.vscode/tasks.json` "Dev Server" task runs `npm start` on folder open and was failing with "Missing script".
-
-- #35: closed the aa-wordmark stray-fragment regression in `cheapDespeckle` (`js/bilinear-worker.js`). Went through two iterations — an initial 100%-vote despeckle rule (a4e47c9) proved too aggressive on other content, replaced with a decoupled spur-removal pass (dd57733) gated on boundary adjacency rather than size alone (47fb7bd), plus a fixture correction (1de6cc1) to actually exercise the `spurArea=4` case it claimed to cover.
-- #36 (Scout): added Playwright coverage for the bilinear-2x path, the native-size fallback gate at `BILINEAR_NATIVE_SAFE_LIMIT`, the 3x/4x-removal regression guard, and Worker construction/timeout failure handling (`tests/bilinear.spec.ts`).
-- #37: added an app-wide upload size cap — rejects uploads above 6000px longest-side before the trace pipeline runs, with a clear user-facing message, using #34's ~7300-8000px crash-ceiling evidence as the basis for the margin.
-- #38: `onSelectDragEnd()`'s `'new'`-drag-mode branch was the sole call site mutating `imagePanX`/`imagePanY` without an immediate `redrawSelectCanvasBackground()` — added it, matching every other pan-mutation site in `js/app.js`. Fixed the Center button reading stale pixels and double-counting a silent `clampPanToBox` correction.
-- #39: added `SMALL_SOURCE_DIM=256` gate — below it, `smoothMask`'s majority-vote thresholds relax (stops deleting 1px strokes / bridging 1px gaps) and `despeckleNative` scales down proportionally; unchanged at/above the cutoff. Fixes smeared/merged small-logo text without affecting normal-sized sources.
-- #40: added a Levels control (black point / white point / gamma) on the source image, upstream of thresholding, luminance-only. Wired into the existing generic `CONTROL_DEFS` mechanism (undo/redo, live-preview debounce) rather than bespoke code. Additive to #39, not a substitute — doesn't touch color tracing (still on hold).
+- Drop-to-replace: `#dropzone` is hidden after load, so its drop handlers stopped firing and the browser default took over. Moved file-drop handling to window-level dragenter/dragover/dragleave/drop (only for drags carrying `'Files'`), all routed through `handleFile` — single code path; `#dropzone` handlers now only toggle its highlight.
+- In-page drags (e.g. the `<img>` thumbnail, which Chrome reports as `'Files'`) are ignored via a document-level `dragstart` flag.
+- `#drop-overlay` ("Drop to replace image") shows only once an image is loaded; `pointer-events:none`, depth-counter to avoid flicker. Needs explicit `#drop-overlay[hidden]{display:none}` because its `display:flex` otherwise beats `[hidden]`.
+- State on replace is identical to the replace-file input (by construction): clears remembered crop only; undo history, Levels, settings, and trace output persist — pre-existing behavior, left as-is.
 
 ## Next issues
 
-- #33 (Scout): Playwright coverage for the #26/#28 tooltip/popover feature — not started, still open.
-- Color-aware tracing: on hold per user request until color capabilities come up again.
-- Possible future: `touchcancel` handling for pinch/pan if an interrupted OS gesture ever turns out to be a real-world pain point (flagged in #23, not urgent).
+- #33 (Scout): Playwright coverage for the #26/#28 tooltip/popover feature — still open.
+- Scout: regression test for drop-to-replace (scratch harness used for manual verification, not in `tests/`).
+- Possible: `handleFile` silently ignores dropped non-image files (file pickers' `accept="image/*"` used to hide this) — consider a user-facing message.
+- Color-aware tracing: on hold per user request.
+- Possible future: `touchcancel` handling for pinch/pan (flagged in #23, not urgent).
 
 ## Gotchas
 
 - Plain static HTML/JS app — no build step, no framework
-- `preprocessImageData` (`js/app.js`) is async, gated by `BILINEAR_NATIVE_SAFE_LIMIT=3500` (native longest dimension) and the new #37 upload cap at 6000px — touching this pipeline needs manual verification at real upload sizes, not just isolated spike harnesses
-- `SMALL_SOURCE_DIM=256` (js/app.js) gates #39's relaxed smoothMask/despeckle behavior — any future despeckle/smoothing tuning must check both size tiers
-- Levels (`applyLevels()`) runs on continuous luminance before Otsu/threshold resolution, ahead of both the native and bilinear paths — a third pipeline stage now precedes thresholding alongside despeckle/smoothMask, keep the ordering in mind for future pipeline changes
-- `tests/bilinear.spec.ts:172` ("just below the gate (3499px)...") is a known pre-existing sandbox timing flake, independently reproduced against unmodified code by three separate sessions this cycle — not a real regression, don't chase it without new evidence
+- `preprocessImageData` (`js/app.js`) is async, gated by `BILINEAR_NATIVE_SAFE_LIMIT=3500` and the #37 upload cap at 6000px — verify at real upload sizes
+- `SMALL_SOURCE_DIM=256` gates #39's relaxed smoothMask/despeckle — tune both size tiers
+- Levels (`applyLevels()`) runs before Otsu/threshold resolution on both native and bilinear paths
+- `tests/bilinear.spec.ts:172` (3499px gate) is a known pre-existing sandbox timing flake — fails on unmodified main too; don't chase without new evidence
