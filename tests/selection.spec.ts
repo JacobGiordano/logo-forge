@@ -827,3 +827,104 @@ test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-fing
     expect(parseInt(zoomText || '0', 10)).toBeGreaterThan(100);
   });
 });
+
+test.describe('selection UI — touch input: touchcancel ends the gesture', () => {
+  test.use({ hasTouch: true });
+
+  // When the browser aborts a touch (system gesture, alert, palm rejection)
+  // it fires touchcancel and no touchend. Before the fix, select-canvas only
+  // listened for touchend, so the document-level touchmove listener and the
+  // drag/pinch state stayed live after a cancel: any later stray touchmove
+  // kept resizing the abandoned box or pinch-zooming the view. These tests
+  // drive real (CDP) touch input so the browser itself emits touchcancel.
+  type TP = { x: number; y: number; id?: number };
+
+  async function touchSession(page: Page) {
+    const cdp = await page.context().newCDPSession(page);
+    const cb = await canvasBox(page);
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd' | 'touchCancel', pts: TP[] = []) =>
+      cdp.send('Input.dispatchTouchEvent', {
+        type,
+        touchPoints: pts.map((p) => ({ x: cb.x + p.x, y: cb.y + p.y, id: p.id ?? 0 })),
+      });
+    return send;
+  }
+
+  // A stray touchmove reaching the document after the gesture should have
+  // ended — what a still-registered listener would wrongly act on.
+  async function strayDocumentTouchmove(page: Page, pts: { x: number; y: number }[]) {
+    await page.evaluate((pts) => {
+      const el = document.getElementById('select-canvas')!;
+      const r = el.getBoundingClientRect();
+      const touches = pts.map((p, i) => new Touch({ identifier: i + 1, target: el, clientX: r.left + p.x, clientY: r.top + p.y }));
+      document.dispatchEvent(new TouchEvent('touchmove', {
+        bubbles: true, cancelable: true, touches, targetTouches: touches, changedTouches: touches,
+      }));
+    }, pts);
+  }
+
+  const gestureState = (page: Page) =>
+    page.evaluate(() => ({ dragMode, dragOrigin, pinch: pinchState, zoom: viewZoom }));
+
+  test('touchcancel mid single-finger drag ends the drag; later touchmoves do not change the box', async ({ page }) => {
+    await uploadSheet(page);
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 20, y: 20 }]);
+    await send('touchMove', [{ x: 120, y: 120 }]);
+    expect((await gestureState(page)).dragMode).toBe('new');
+
+    await send('touchCancel');
+    const s = await gestureState(page);
+    expect(s.dragMode).toBeNull();
+    expect(s.dragOrigin).toBeNull();
+
+    const boxAfterCancel = await page.evaluate(() => (selectionBox ? { ...selectionBox } : null));
+    await strayDocumentTouchmove(page, [{ x: 240, y: 240 }]);
+    const boxAfterStray = await page.evaluate(() => (selectionBox ? { ...selectionBox } : null));
+    expect(boxAfterStray).toEqual(boxAfterCancel);
+  });
+
+  test('touchcancel during a two-finger pinch ends the pinch; later touchmoves do not zoom', async ({ page }) => {
+    await uploadSheet(page);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 110, y: 130, id: 1 }, { x: 150, y: 130, id: 2 }]);
+    const mid = await gestureState(page);
+    expect(mid.dragMode).toBe('touch-pinch');
+    expect(mid.pinch).not.toBeNull();
+
+    await send('touchCancel');
+    const s = await gestureState(page);
+    expect(s.pinch).toBeNull();
+    expect(s.dragMode).toBeNull();
+
+    // Fingers spreading 40px -> 160px would be a 4x pinch-out if a stale
+    // pinch listener were still attached.
+    await strayDocumentTouchmove(page, [{ x: 50, y: 130 }, { x: 210, y: 130 }]);
+    expect((await gestureState(page)).zoom).toBe(s.zoom);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+  });
+
+  test('after a cancelled pinch, a fresh one-finger touch starts a new box drag and leaves zoom alone', async ({ page }) => {
+    await uploadSheet(page);
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 110, y: 130, id: 1 }, { x: 150, y: 130, id: 2 }]);
+    await send('touchCancel');
+    const zoom0 = (await gestureState(page)).zoom;
+
+    await send('touchStart', [{ x: 20, y: 20, id: 3 }]);
+    await send('touchMove', [{ x: 100, y: 100, id: 3 }]);
+    expect((await gestureState(page)).dragMode).toBe('new');
+    await send('touchEnd');
+
+    const s = await gestureState(page);
+    expect(s.dragMode).toBeNull();
+    expect(s.pinch).toBeNull();
+    expect(s.zoom).toBe(zoom0);
+    await expect(page.locator('#select-rect')).toBeVisible();
+    await expect(page.locator('#select-confirm-btn')).toBeEnabled();
+  });
+});
