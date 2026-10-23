@@ -1462,11 +1462,64 @@ dz.addEventListener('keydown', e => {
     document.getElementById('file-input').click();
   }
 });
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
-dz.addEventListener('drop', e => {
-  e.preventDefault();
+// ── Drag-and-drop (window-level) ──────────────────────────────────────────
+// Single drop path for the whole app: the #dropzone used to own its own
+// dragover/drop handlers, but it's display:none once an image loads, after
+// which nothing prevented the browser's default "open the file in a tab"
+// navigation. Everything now routes through these window handlers, so a drop
+// on the dropzone and a drop anywhere over the loaded app both reach
+// handleFile() exactly once — the dropzone keeps only its hover highlight.
+//
+// Only external file drags are acted on. In-page drags (selected text, the
+// <img> thumbnail — which Chrome reports with a 'Files' type too) start with
+// a dragstart inside this document, so they're flagged and left alone.
+const dropOverlay = document.getElementById('drop-overlay');
+let dragDepth = 0;
+let internalDrag = false;
+
+function isFileDrag(e) {
+  if (internalDrag || !e.dataTransfer) return false;
+  return Array.from(e.dataTransfer.types || []).includes('Files');
+}
+
+function clearDragCue() {
+  dragDepth = 0;
+  dropOverlay.hidden = true;
   dz.classList.remove('drag-over');
+}
+
+document.addEventListener('dragstart', () => { internalDrag = true; });
+document.addEventListener('dragend', () => { internalDrag = false; clearDragCue(); });
+
+window.addEventListener('dragenter', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  // The full-window cue is only for the loaded app — while the dropzone is
+  // still showing, it is the cue.
+  if (dz.style.display === 'none') dropOverlay.hidden = false;
+});
+
+window.addEventListener('dragover', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  dz.classList.toggle('drag-over', dz.contains(e.target));
+});
+
+window.addEventListener('dragleave', e => {
+  if (!isFileDrag(e)) return;
+  // Every dragenter on a child is paired with a dragleave on the element it
+  // came from, so the depth only returns to 0 when the drag leaves the window.
+  // (relatedTarget isn't reliable for drag events across browsers.)
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) clearDragCue();
+});
+
+window.addEventListener('drop', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  clearDragCue();
   handleFile(e.dataTransfer.files[0]);
 });
 

@@ -117,6 +117,27 @@ header h1 span{color:var(--accent);}
 #dropzone input{
   position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;
 }
+/* Full-window drop cue, shown while a file is dragged over the loaded app.
+   pointer-events:none so drag events keep landing on the real elements
+   underneath (the window-level depth counter in app.js relies on that). */
+#drop-overlay{
+  position:fixed;inset:0;z-index:1000;
+  display:flex;align-items:center;justify-content:center;
+  padding:16px;
+  background:rgba(12,12,13,0.72);
+  pointer-events:none;
+}
+#drop-overlay[hidden]{display:none;}
+.drop-overlay-inner{
+  width:100%;height:100%;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  border:1.5px dashed var(--accent);
+  border-radius:var(--r);
+  background:rgba(184,255,87,0.04);
+  text-align:center;
+}
+.drop-overlay-inner .dz-icon{opacity:0.7;color:var(--accent);}
+.drop-overlay-inner .dz-head{font-size:14px;}
 .dz-icon{font-size:26px;margin-bottom:8px;opacity:0.4;line-height:1;}
 .dz-head{font-size:12px;color:var(--text);margin-bottom:4px;font-weight:500;}
 .dz-sub{font-size:11px;color:var(--muted);line-height:1.5;}
