@@ -502,6 +502,7 @@ function handleFile(file) {
   // selection state was remembered for the prior image.
   lastUploadedSheet = null;
   lastCropRect = null;
+  lastCropFill = null;
   const reader = new FileReader();
   reader.onload = e => {
     const img = new Image();
@@ -727,11 +728,7 @@ function redrawSelectCanvasBackground() {
   if (!pendingImage) return;
   const ctx = selectCanvas.getContext('2d');
   ctx.clearRect(0, 0, selectCanvas.width, selectCanvas.height);
-  const scale = selectBaseScale * viewZoom;
-  ctx.drawImage(
-    pendingImage, 0, 0, pendingImage.width, pendingImage.height,
-    imagePanX, imagePanY, pendingImage.width * scale, pendingImage.height * scale
-  );
+  drawSelectView(ctx, true);
 }
 
 // Clamps imagePanX/Y so the given box (canvas-display px) stays fully
@@ -740,13 +737,18 @@ function redrawSelectCanvasBackground() {
 // model: the frame is fixed, only the content under it slides. Generalized
 // here to use the current zoomed draw size instead of always assuming
 // zoom 1 (previously destW/destH == selectCanvas.width/height always).
+//
+// #41: "covered" means covered by the image *plus* padAllowance (source px
+// per side, so it scales with zoom exactly like the image does). With no
+// allowance this is the original clamp unchanged.
 function clampPanToBox(box) {
   if (!box || !pendingImage) return;
   const scale = selectBaseScale * viewZoom;
+  const a = padAllowance;
   const destW = pendingImage.width * scale;
   const destH = pendingImage.height * scale;
-  imagePanX = clamp(imagePanX, box.x + box.w - destW, box.x);
-  imagePanY = clamp(imagePanY, box.y + box.h - destH, box.y);
+  imagePanX = clamp(imagePanX, box.x + box.w - destW - a.r * scale, box.x + a.l * scale);
+  imagePanY = clamp(imagePanY, box.y + box.h - destH - a.b * scale, box.y + a.t * scale);
 }
 
 // Clamps imagePanX/Y so the WHOLE canvas stays covered by drawn image
@@ -760,8 +762,182 @@ function clampPanToCanvas() {
   const scale = selectBaseScale * viewZoom;
   const destW = pendingImage.width * scale;
   const destH = pendingImage.height * scale;
-  imagePanX = clamp(imagePanX, selectCanvas.width - destW, 0);
-  imagePanY = clamp(imagePanY, selectCanvas.height - destH, 0);
+  const a = padAllowance;
+  imagePanX = clamp(imagePanX, selectCanvas.width - destW - a.r * scale, a.l * scale);
+  imagePanY = clamp(imagePanY, selectCanvas.height - destH - a.b * scale, a.t * scale);
+}
+
+// ── Center padding (#41) ─────────────────────────────────────────────────
+// Center may need the frame to extend past the source image's edge to
+// truly center a subject that sits close to it. padAllowance (source px per
+// side) is how far past each edge the frame may currently reach; padFill is
+// what that area becomes in the crop. Both are only ever *granted* by
+// centerSubjectInFrame() (or re-established by Edit crop for a padded
+// rect); every other framing change can only shrink the allowance
+// (shrinkPadAllowance) so nothing ever jumps further out than Center put
+// it. A new box, Clear, and openSelectionView() reset it to zero.
+//
+// padFill: null (no padding), or {r,g,b,a} with a=0 for transparent.
+let padAllowance = { l: 0, r: 0, t: 0, b: 0 };
+let padFill = null;
+let lastCropFill = null; // padFill for lastCropRect, so Edit crop round-trips a padded rect
+
+function resetPadAllowance() {
+  padAllowance = { l: 0, r: 0, t: 0, b: 0 };
+  padFill = null;
+}
+
+function padNeeded(a) {
+  return a.l > 0 || a.r > 0 || a.t > 0 || a.b > 0;
+}
+
+// How far (source px) a source rect reaches past each image edge.
+function padNeedForSourceRect(src) {
+  return {
+    l: Math.max(0, -src.sx),
+    t: Math.max(0, -src.sy),
+    r: Math.max(0, src.sx + src.sw - pendingImage.width),
+    b: Math.max(0, src.sy + src.sh - pendingImage.height),
+  };
+}
+
+// Shrink-only: after any framing change other than Center, the allowance
+// never exceeds what the current box actually still needs.
+function shrinkPadAllowance() {
+  if (!padNeeded(padAllowance)) return;
+  if (!selectionBox) { resetPadAllowance(); return; }
+  const need = padNeedForSourceRect(displayRectToSourceRect(selectionBox));
+  padAllowance = {
+    l: Math.min(padAllowance.l, need.l),
+    r: Math.min(padAllowance.r, need.r),
+    t: Math.min(padAllowance.t, need.t),
+    b: Math.min(padAllowance.b, need.b),
+  };
+  if (!padNeeded(padAllowance)) padFill = null;
+}
+
+// Fill rule: if the source pixels along the image edge(s) being padded
+// are mostly transparent, pad transparent (the trace composites alpha onto
+// white, so this matches how the existing background already traces).
+// Otherwise pad with the per-channel median of the frame's non-subject
+// pixels — the background class from Center's own Otsu mask, which is
+// robust to the subject itself touching the edge (an edge strip alone
+// would pick up subject pixels on a tightly cropped logo) and, being a
+// median, to anti-aliased fringes.
+const PAD_EDGE_STRIP_PX = 2;
+
+function choosePadFill(need, framePixels, mask) {
+  const W = pendingImage.width;
+  const H = pendingImage.height;
+  const src = displayRectToSourceRect(selectionBox);
+  const y0 = clamp(Math.floor(src.sy), 0, H - 1);
+  const y1 = clamp(Math.ceil(src.sy + src.sh), y0 + 1, H);
+  const x0 = clamp(Math.floor(src.sx), 0, W - 1);
+  const x1 = clamp(Math.ceil(src.sx + src.sw), x0 + 1, W);
+  const d = Math.min(PAD_EDGE_STRIP_PX, W, H);
+  const strips = [];
+  if (need.l > 0) strips.push([0, y0, d, y1 - y0]);
+  if (need.r > 0) strips.push([W - d, y0, d, y1 - y0]);
+  if (need.t > 0) strips.push([x0, 0, x1 - x0, d]);
+  if (need.b > 0) strips.push([x0, H - d, x1 - x0, d]);
+
+  let total = 0;
+  let clear = 0;
+  for (const [sx, sy, sw, sh] of strips) {
+    const c = document.createElement('canvas');
+    c.width = sw;
+    c.height = sh;
+    const cx = c.getContext('2d');
+    cx.drawImage(pendingImage, sx, sy, sw, sh, 0, 0, sw, sh);
+    const px = cx.getImageData(0, 0, sw, sh).data;
+    for (let i = 3; i < px.length; i += 4) {
+      total++;
+      if (px[i] < 128) clear++;
+    }
+  }
+  if (total > 0 && clear / total > 0.5) return { r: 0, g: 0, b: 0, a: 0 };
+
+  const rs = [], gs = [], bs = [];
+  for (let i = 0, p = 0; i < framePixels.length; i += 4, p++) {
+    if (mask[p] || framePixels[i + 3] < 128) continue;
+    rs.push(framePixels[i]); gs.push(framePixels[i + 1]); bs.push(framePixels[i + 2]);
+  }
+  if (!rs.length) return { r: 255, g: 255, b: 255, a: 255 };
+  const median = arr => { arr.sort((x, y) => x - y); return arr[arr.length >> 1]; };
+  return { r: median(rs), g: median(gs), b: median(bs), a: 255 };
+}
+
+// Fills the outer rect minus the inner (image) rect — padding only, never
+// under the image, so the image's own semi-transparent pixels are left
+// exactly as they are rather than composited onto the fill.
+function fillPadRegion(ctx, outer, inner, style) {
+  ctx.save();
+  ctx.fillStyle = style;
+  ctx.beginPath();
+  ctx.rect(outer.x, outer.y, outer.w, outer.h);
+  ctx.rect(inner.x, inner.y, inner.w, inner.h);
+  ctx.fill('evenodd');
+  ctx.restore();
+}
+
+let padCheckerPattern = null;
+function padCheckerStyle(ctx) {
+  if (!padCheckerPattern) {
+    // Same two-tone checker convention as .select-canvas-wrap's background,
+    // a few steps lighter so padding reads as distinct from uncovered canvas.
+    const tile = document.createElement('canvas');
+    tile.width = tile.height = 14;
+    const t = tile.getContext('2d');
+    t.fillStyle = '#3a3a40';
+    t.fillRect(0, 0, 14, 14);
+    t.fillStyle = '#2b2b30';
+    t.fillRect(0, 0, 7, 7);
+    t.fillRect(7, 7, 7, 7);
+    padCheckerPattern = ctx.createPattern(tile, 'repeat');
+  }
+  return padCheckerPattern;
+}
+
+function padFillCss(fill) {
+  return 'rgba(' + fill.r + ',' + fill.g + ',' + fill.b + ',' + (fill.a / 255) + ')';
+}
+
+// Draws the sheet (plus any Center padding) at the current pan/zoom.
+// preview=true shows transparent padding as a checkerboard for the user;
+// preview=false leaves it truly transparent, for pixel analysis.
+function drawSelectView(ctx, preview) {
+  const scale = selectBaseScale * viewZoom;
+  const W = pendingImage.width;
+  const H = pendingImage.height;
+  const inner = { x: imagePanX, y: imagePanY, w: W * scale, h: H * scale };
+  if (padFill && padNeeded(padAllowance)) {
+    const a = padAllowance;
+    const outer = {
+      x: imagePanX - a.l * scale,
+      y: imagePanY - a.t * scale,
+      w: (W + a.l + a.r) * scale,
+      h: (H + a.t + a.b) * scale,
+    };
+    if (padFill.a > 0) fillPadRegion(ctx, outer, inner, padFillCss(padFill));
+    else if (preview) fillPadRegion(ctx, outer, inner, padCheckerStyle(ctx));
+  }
+  ctx.drawImage(pendingImage, 0, 0, W, H, inner.x, inner.y, inner.w, inner.h);
+}
+
+// Source rect (may extend past the image, #41) → canvas of exactly sw×sh,
+// with the out-of-image area filled per `fill` (null/transparent = left
+// clear). Used for both the confirmed crop and auto-trim's analysis.
+function renderPaddedSourceRect(sx, sy, sw, sh, fill) {
+  const c = document.createElement('canvas');
+  c.width = sw;
+  c.height = sh;
+  const ctx = c.getContext('2d');
+  const inner = { x: -sx, y: -sy, w: pendingImage.width, h: pendingImage.height };
+  if (fill && fill.a > 0 && (sx < 0 || sy < 0 || sx + sw > inner.w || sy + sh > inner.h)) {
+    fillPadRegion(ctx, { x: 0, y: 0, w: sw, h: sh }, inner, padFillCss(fill));
+  }
+  ctx.drawImage(pendingImage, -sx, -sy);
+  return c;
 }
 
 // Keeps a display-space box's coordinates sane after being reprojected
@@ -816,10 +992,15 @@ function sourceRectToDisplayRect(rect) {
 function selectionRectToSourceRect(rect) {
   if (!pendingImage) return null;
   const raw = displayRectToSourceRect(rect);
-  const sw = Math.max(1, Math.min(pendingImage.width, Math.round(raw.sw)));
-  const sh = Math.max(1, Math.min(pendingImage.height, Math.round(raw.sh)));
-  const sx = clamp(Math.round(raw.sx), 0, pendingImage.width - sw);
-  const sy = clamp(Math.round(raw.sy), 0, pendingImage.height - sh);
+  // Bounds are the image plus any Center padding allowance (#41), rounded
+  // outward to whole source px; with no allowance this is the image itself.
+  const a = padAllowance;
+  const minX = -Math.ceil(a.l), maxX = pendingImage.width + Math.ceil(a.r);
+  const minY = -Math.ceil(a.t), maxY = pendingImage.height + Math.ceil(a.b);
+  const sw = Math.max(1, Math.min(maxX - minX, Math.round(raw.sw)));
+  const sh = Math.max(1, Math.min(maxY - minY, Math.round(raw.sh)));
+  const sx = clamp(Math.round(raw.sx), minX, maxX - sw);
+  const sy = clamp(Math.round(raw.sy), minY, maxY - sh);
   return { sx, sy, sw, sh };
 }
 
@@ -841,6 +1022,7 @@ function applyZoom(newZoomRaw, anchor) {
   clampPanToCanvas();
 
   if (sourceBoxRect) selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(sourceBoxRect));
+  shrinkPadAllowance();
   redrawSelectCanvasBackground();
   updateSelectRectEl();
   updateZoomReadout();
@@ -870,6 +1052,7 @@ function applyPinchZoomPan(newZoomRaw, mid) {
   if (pinchState.sourceBoxRect) {
     selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(pinchState.sourceBoxRect));
   }
+  shrinkPadAllowance();
   redrawSelectCanvasBackground();
   updateSelectRectEl();
   updateZoomReadout();
@@ -885,6 +1068,7 @@ function panViewBy(dx, dy) {
   imagePanY += dy;
   clampPanToCanvas();
   if (sourceBoxRect) selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(sourceBoxRect));
+  shrinkPadAllowance();
   redrawSelectCanvasBackground();
   updateSelectRectEl();
 }
@@ -902,7 +1086,7 @@ function isFormField(el) {
 }
 
 function clearSelectionBox() {
-  clearCenterLimitedStatus();
+  resetPadAllowance();
   selectionBox = null;
   dragOrigin = null;
   dragMode = null;
@@ -1084,6 +1268,11 @@ function onSelectDragStart(e) {
     dragMode = 'new';
     dragOrigin = p;
     selectionBox = { x: p.x, y: p.y, w: 0, h: 0 };
+    // A brand-new frame starts with no Center padding (#41).
+    if (padNeeded(padAllowance)) {
+      resetPadAllowance();
+      redrawSelectCanvasBackground();
+    }
   }
   updateSelectRectEl();
   document.addEventListener('mousemove', onSelectDrag);
@@ -1132,12 +1321,14 @@ function onSelectDrag(e) {
     ny = clamp(ny, 0, selectCanvas.height - nh);
     selectionBox = { x: nx, y: ny, w: nw, h: nh };
     clampPanToBox(selectionBox);
+    shrinkPadAllowance();
     redrawSelectCanvasBackground();
   } else if (dragMode === 'pan') {
     if (!panDragStart) return;
     imagePanX = panDragStart.panX + (p.x - panDragStart.x);
     imagePanY = panDragStart.panY + (p.y - panDragStart.y);
     clampPanToBox(selectionBox);
+    shrinkPadAllowance();
     redrawSelectCanvasBackground();
   } else if (dragMode === 'view-pan') {
     if (!viewPanDragStart) return;
@@ -1147,6 +1338,7 @@ function onSelectDrag(e) {
     if (viewPanDragStart.sourceBoxRect) {
       selectionBox = clampBoxToCanvas(sourceRectToDisplayRect(viewPanDragStart.sourceBoxRect));
     }
+    shrinkPadAllowance();
     redrawSelectCanvasBackground();
   } else if (dragMode === 'touch-pinch') {
     // Needs both touch points, not just the touches[0]-only `p` computed
@@ -1170,10 +1362,6 @@ function onSelectDragEnd() {
   document.removeEventListener('touchend', onSelectDragEnd);
   document.removeEventListener('touchcancel', onSelectDragEnd);
 
-  // Any drag that changes what the frame covers (#41) invalidates a
-  // "couldn't fully center" warning; view-pan/pinch only move the view and
-  // keep the box attached to the same source content, so they don't.
-  if (dragMode === 'new' || dragMode === 'resize' || dragMode === 'pan') clearCenterLimitedStatus();
 
   if (dragMode === 'new') {
     const valid = selectionBox && selectionBox.w >= MIN_SELECT_PX && selectionBox.h >= MIN_SELECT_PX;
@@ -1230,12 +1418,20 @@ selectCenterBtn.addEventListener('click', () => {
 });
 
 function centerSubjectInFrame() {
-  const ctx = selectCanvas.getContext('2d');
   const fx = Math.round(selectionBox.x);
   const fy = Math.round(selectionBox.y);
   const fw = Math.max(1, Math.round(selectionBox.w));
   const fh = Math.max(1, Math.round(selectionBox.h));
-  const frameData = ctx.getImageData(fx, fy, fw, fh);
+  // Rendered offscreen from the live pan/zoom/padding state rather than read
+  // back from select-canvas: the preview draws transparent padding as a
+  // checkerboard (#41), which must not be mistaken for image content.
+  const frameCanvas = document.createElement('canvas');
+  frameCanvas.width = fw;
+  frameCanvas.height = fh;
+  const frameCtx = frameCanvas.getContext('2d');
+  frameCtx.translate(-fx, -fy);
+  drawSelectView(frameCtx, false);
+  const frameData = frameCtx.getImageData(0, 0, fw, fh);
 
   const luminance = new Uint8Array(fw * fh);
   const hist = new Uint32Array(256);
@@ -1277,43 +1473,20 @@ function centerSubjectInFrame() {
   const subjectCy = (minY + maxY + 1) / 2;
   const wantDx = fw / 2 - subjectCx;
   const wantDy = fh / 2 - subjectCy;
-  const panX0 = imagePanX;
-  const panY0 = imagePanY;
   imagePanX += wantDx;
   imagePanY += wantDy;
+
+  // #41: centering a subject near the source image's own edge needs the
+  // fixed-size frame to extend past that edge. Grant exactly the padding
+  // the new framing needs (replacing any earlier allowance) and pick what
+  // fills it, then clamp — which is now a no-op beyond float drift.
+  const need = padNeedForSourceRect(displayRectToSourceRect(selectionBox));
+  padAllowance = need;
+  padFill = padNeeded(need) ? choosePadFill(need, frameData.data, mask) : null;
   clampPanToBox(selectionBox);
   redrawSelectCanvasBackground();
   updateSelectRectEl();
-
-  // #41: clampPanToBox can claw back part of the delta when the subject
-  // sits close to the source image's own edge — centering it would need
-  // the fixed-size frame to extend past the image. That's a hard geometric
-  // limit, not something a different pan/box split can work around (the
-  // clamp constrains the box *relative to the image*, which is exactly the
-  // same quantity centering changes), so say so instead of silently doing
-  // less than asked.
-  const residualX = wantDx - (imagePanX - panX0);
-  const residualY = wantDy - (imagePanY - panY0);
-  if (Math.abs(residualX) > CENTER_RESIDUAL_TOL_PX || Math.abs(residualY) > CENTER_RESIDUAL_TOL_PX) {
-    setStatus(CENTER_LIMITED_STATUS, 'warn');
-  } else {
-    clearCenterLimitedStatus();
-  }
 }
-
-// Status shown when Center (#41) can only partially center the subject.
-// Cleared (back to the normal selection-view status) by a later successful
-// Center or any change to the frame/framing, so it never outlives the
-// framing it describes.
-const CENTER_LIMITED_STATUS = "Couldn't fully center — the subject is too close to the image edge. Try a smaller selection.";
-const CENTER_RESIDUAL_TOL_PX = 1; // canvas-display px
-
-function clearCenterLimitedStatus() {
-  const el = document.getElementById('status');
-  if (el.textContent !== CENTER_LIMITED_STATUS) return;
-  setStatus(isTouchPrimary() ? SELECT_STATUS_TOUCH : SELECT_STATUS_DESKTOP);
-}
-
 // ── Auto-trim (#6) ────────────────────────────────────────────────────────
 // Tightens a loose marquee selection to the bounding box of non-background
 // content found inside it. Reuses the same lightweight luminance + Otsu-
@@ -1332,12 +1505,12 @@ function clearCenterLimitedStatus() {
 // degrade with the display's downscale.
 const AUTO_TRIM_MARGIN_PX = 2; // small breathing room left around the detected bbox, in source px
 
-function autoTrimSourceRect(sx, sy, sw, sh) {
-  const c = document.createElement('canvas');
-  c.width = sw;
-  c.height = sh;
+function autoTrimSourceRect(sx, sy, sw, sh, fill) {
+  // The rect may extend past the image (#41 padding) — analyse it exactly
+  // as it will be cropped, padding included, so the fill is classified as
+  // background like the rest of the frame.
+  const c = renderPaddedSourceRect(sx, sy, sw, sh, fill);
   const ctx = c.getContext('2d');
-  ctx.drawImage(pendingImage, sx, sy, sw, sh, 0, 0, sw, sh);
   const frameData = ctx.getImageData(0, 0, sw, sh);
 
   const luminance = new Uint8Array(sw * sh);
@@ -1466,19 +1639,18 @@ selectConfirmBtn.addEventListener('click', () => {
   // detected bbox converges to the same margin-padded rect it started
   // from — so no special-casing is needed to avoid it "double-trimming".
   if (autoTrimEnabled) {
-    ({ sx, sy, sw, sh } = autoTrimSourceRect(sx, sy, sw, sh));
+    ({ sx, sy, sw, sh } = autoTrimSourceRect(sx, sy, sw, sh, padFill));
   }
+  const fill = padNeeded(padNeedForSourceRect({ sx, sy, sw, sh })) ? padFill : null;
 
   // Remember the original sheet and this crop rect (true source pixels) so
   // "Edit crop" can reopen the selection view pre-filled later — separate
   // from pendingImage, which finalizeImage() is about to null out.
   lastUploadedSheet = pendingImage;
   lastCropRect = { sx, sy, sw, sh };
+  lastCropFill = fill;
 
-  const cropCanvas = document.createElement('canvas');
-  cropCanvas.width = sw;
-  cropCanvas.height = sh;
-  cropCanvas.getContext('2d').drawImage(pendingImage, sx, sy, sw, sh, 0, 0, sw, sh);
+  const cropCanvas = renderPaddedSourceRect(sx, sy, sw, sh, fill);
 
   const dataUrl = cropCanvas.toDataURL('image/png');
   const cropped = new Image();
@@ -1502,7 +1674,20 @@ editCropBtn.addEventListener('click', () => {
   // at that fit-to-view scale (selectBaseScale, i.e. viewZoom 1).
   openSelectionView(lastUploadedSheet);
   if (lastCropRect) {
+    // A padded rect (#41) re-establishes exactly the allowance it needs,
+    // with its original fill, then pans just far enough to bring the box
+    // fully on-canvas (a rect reaching past the left/top image edge would
+    // otherwise project to a negative display position at pan 0).
+    const need = padNeedForSourceRect(lastCropRect);
+    if (padNeeded(need) && lastCropFill) {
+      padAllowance = need;
+      padFill = lastCropFill;
+    }
+    let box = sourceRectToDisplayRect(lastCropRect);
+    imagePanX -= box.x < 0 ? box.x : Math.max(0, box.x + box.w - selectCanvas.width);
+    imagePanY -= box.y < 0 ? box.y : Math.max(0, box.y + box.h - selectCanvas.height);
     selectionBox = sourceRectToDisplayRect(lastCropRect);
+    redrawSelectCanvasBackground();
     updateSelectRectEl();
     selectConfirmBtn.disabled = false;
   }
