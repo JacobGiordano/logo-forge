@@ -50,7 +50,7 @@ test.describe('potrace-wasm fallback', () => {
     // try/catch (js/app.js ~1093-1106) takes the imagetracer.js fallback
     // branch instead of the potrace-wasm one.
     await page.addInitScript(() => { delete (window as any).WebAssembly; });
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
 
     await page.locator('#file-input').setInputFiles(FIXTURE);
     await waitForFileReady(page);
@@ -87,7 +87,7 @@ test.describe('potrace-wasm load-timing race', () => {
       if (msg.text().includes('falling back to built-in tracer')) fallbackWarnings.push(msg.text());
     });
 
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(FIXTURE); // fires PotraceTrace.warm()
     await waitForFileReady(page);
 
@@ -116,7 +116,7 @@ test.describe('potrace-wasm load-timing race', () => {
       await route.continue();
     });
 
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(FIXTURE);
     await waitForFileReady(page);
 
@@ -144,7 +144,7 @@ test.describe('potrace-wasm load-timing race', () => {
 
 test.describe('vector-fit slider range coverage', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(FIXTURE);
     await waitForFileReady(page);
   });

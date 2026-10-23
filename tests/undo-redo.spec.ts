@@ -17,7 +17,7 @@ async function uploadAndTrace(page: Page, threshold = '128') {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('http://localhost:4321');
+  await page.goto('/');
 });
 
 test('undo and redo buttons are disabled on load', async ({ page }) => {

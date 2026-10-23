@@ -84,7 +84,7 @@ const overlay = (page: Page) => page.locator('#drop-overlay');
 
 test.describe('drop to replace — after an image is loaded', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await loadViaInput(page);
   });
 
@@ -181,7 +181,7 @@ test.describe('drop to replace — after an image is loaded', () => {
 
 test.describe('drop to replace — before any image is loaded', () => {
   test('a file drag over the empty app does not show the replace overlay', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await expect(page.locator('#dropzone')).toBeVisible();
     await drag(page, 'file', [enter('#dropzone'), over('#dropzone')]);
     // The dropzone itself is the cue while it is showing.
@@ -190,7 +190,7 @@ test.describe('drop to replace — before any image is loaded', () => {
 
   test('dropping a file on #dropzone loads it exactly once', async ({ page }) => {
     await countLoads(page);
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     const prevented = await drag(page, 'file', [enter('#dropzone'), over('#dropzone'), drop('#dropzone')], SMALL);
     expect(prevented).toEqual([true, true, true]);
     await expect(page.locator('#thumb-wrap')).toBeVisible({ timeout: 3000 });
@@ -203,7 +203,7 @@ test.describe('drop to replace — before any image is loaded', () => {
   });
 
   test('text drags over the dropzone are not intercepted', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     const prevented = await drag(page, 'text', [enter('#dropzone'), over('#dropzone'), drop('#dropzone')]);
     expect(prevented).toEqual([false, false, false]);
     await expect(page.locator('#dropzone')).toBeVisible();

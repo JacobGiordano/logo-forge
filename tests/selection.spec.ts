@@ -36,7 +36,7 @@ const AA_SHEET_FIXTURE = path.resolve(__dirname, 'fixtures/select-sheet-aa.png')
 const SMALL_FIXTURE = path.resolve(__dirname, 'fixtures/test-logo.png');
 
 async function uploadSheet(page: Page, fixture = SHEET_FIXTURE) {
-  await page.goto('http://localhost:4321');
+  await page.goto('/');
   await page.locator('#file-input').setInputFiles(fixture);
   await expect(page.locator('#select-wrap')).toBeVisible({ timeout: 3000 });
 }
@@ -85,7 +85,7 @@ test.describe('selection UI — threshold gating', () => {
   });
 
   test('images at or below the 256px threshold skip the selection view entirely', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     await page.locator('#file-input').setInputFiles(SMALL_FIXTURE);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
     await expect(page.locator('#select-wrap')).toBeHidden();
@@ -513,6 +513,263 @@ test.describe('selection UI — Center button (regression for #38)', () => {
   });
 });
 
+test.describe('selection UI — Center pads past the image edge to truly center (#41)', () => {
+  // #41 (design: "allow padding"): when centering the subject would need the
+  // fixed-size frame to reach past the source image's edge, Center now
+  // grants exactly that much per-side padding (padAllowance, source px) and
+  // picks a fill for it (padFill): transparent if the source's edge strip is
+  // mostly transparent, else the median of the frame's non-subject pixels.
+  // Confirm/auto-trim crop through the padding; Edit crop round-trips it;
+  // every other framing change can only shrink it; Clear / a new box / a new
+  // upload reset it. Before this, clampPanToBox silently under-corrected.
+  //
+  // Geometry at 100% zoom (SHEET_FIXTURE: 512px sheet on a 260px canvas,
+  // scale 260/512): the square icon is source 40..200 (center 120). A box
+  // drawn 8..140 display maps to ~260 source px starting at ~16 — so
+  // centering the square in it puts the frame's left/top edge ~12-13 source
+  // px *past* the image's left/top edge.
+  const PAD_BOX: [number, number, number, number] = [8, 8, 140, 140];
+
+  const state = (page: Page) => page.evaluate(() => ({
+    src: selectionBox ? selectionRectToSourceRect(selectionBox) : null,
+    box: selectionBox ? { ...selectionBox } : null,
+    // typeof guards: these globals only exist since #41's padding change;
+    // reading them defensively keeps this helper usable against older builds.
+    pad: typeof padAllowance === 'undefined' ? { l: 0, r: 0, t: 0, b: 0 } : { ...padAllowance },
+    fill: typeof padFill === 'undefined' || !padFill ? null : { ...padFill },
+    panX: imagePanX,
+    canvasW: (document.getElementById('select-canvas') as HTMLCanvasElement).width,
+    canvasH: (document.getElementById('select-canvas') as HTMLCanvasElement).height,
+  }));
+
+  async function setAutoTrim(page: Page, on: boolean) {
+    const btn = page.locator('#select-autotrim-btn');
+    if ((await btn.getAttribute('aria-pressed')) !== String(on)) await btn.click();
+    await expect(btn).toHaveAttribute('aria-pressed', String(on));
+  }
+
+  async function confirmAndReadCrop(page: Page) {
+    await page.locator('#select-confirm-btn').click();
+    await expect(page.locator('#thumb-wrap')).toBeVisible();
+    return page.locator('#thumb-img').evaluate(async (img: HTMLImageElement) => {
+      await img.decode();
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const px = (x: number, y: number) => Array.from(ctx.getImageData(x, y, 1, 1).data);
+      const w = c.width, h = c.height;
+      return {
+        w, h,
+        corners: [px(0, 0), px(w - 1, 0), px(0, h - 1), px(w - 1, h - 1)],
+        rect: { ...lastCropRect },
+        fill: typeof lastCropFill === 'undefined' || !lastCropFill ? null : { ...lastCropFill },
+      };
+    });
+  }
+
+  async function canvasPixel(page: Page, x: number, y: number) {
+    return page.evaluate(({ x, y }) => {
+      const el = document.getElementById('select-canvas') as HTMLCanvasElement;
+      return Array.from(el.getContext('2d')!.getImageData(Math.round(x), Math.round(y), 1, 1).data);
+    }, { x, y });
+  }
+
+  // Builds a 512x512 PNG with SHEET_FIXTURE's layout (square 40..200,
+  // circle at 380,380 r90) in arbitrary colors, in-browser, and uploads it.
+  async function uploadGeneratedSheet(page: Page, bg: string | null, fg: string) {
+    await page.goto('/');
+    const b64 = await page.evaluate(({ bg, fg }) => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 512;
+      const ctx = c.getContext('2d')!;
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, 512, 512); }
+      ctx.fillStyle = fg;
+      ctx.fillRect(40, 40, 160, 160);
+      ctx.beginPath(); ctx.arc(380, 380, 90, 0, Math.PI * 2); ctx.fill();
+      return c.toDataURL('image/png').split(',')[1];
+    }, { bg, fg });
+    await page.locator('#file-input').setInputFiles({
+      name: 'generated-sheet.png', mimeType: 'image/png', buffer: Buffer.from(b64, 'base64'),
+    });
+    await expect(page.locator('#select-wrap')).toBeVisible({ timeout: 3000 });
+  }
+
+  async function drawPadBoxAndCenter(page: Page) {
+    await dragOnCanvas(page, ...PAD_BOX);
+    await expect(page.locator('#select-rect')).toBeVisible();
+    await page.locator('#select-center-btn').click();
+  }
+
+  test.describe('on the white sheet fixture', () => {
+    test.beforeEach(async ({ page }) => {
+      await uploadSheet(page);
+      await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+    });
+
+    test('Center near the image edge truly centers the subject by granting padding (no warning)', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const s = await state(page);
+      expect(Math.abs(s.src!.sx - -12)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sy - -13)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sw - 263)).toBeLessThanOrEqual(1);
+      expect(Math.abs(s.src!.sh - 263)).toBeLessThanOrEqual(1);
+      // The square icon (source center 120,120) sits at the frame center.
+      // Center measures in whole display px (the frame origin is rounded),
+      // and one display px is ~2 source px here, so allow 1.5 source px.
+      expect(Math.abs(s.src!.sx + s.src!.sw / 2 - 120)).toBeLessThanOrEqual(1.5);
+      expect(Math.abs(s.src!.sy + s.src!.sh / 2 - 120)).toBeLessThanOrEqual(1.5);
+      expect(s.pad.l).toBeGreaterThan(0);
+      expect(s.pad.t).toBeGreaterThan(0);
+      expect(s.pad.r).toBe(0);
+      expect(s.pad.b).toBe(0);
+      await expect(page.locator('#status')).not.toHaveClass('warn');
+      await expect(page.locator('#status')).toHaveText(/^Drag to select a region, then confirm/);
+    });
+
+    test('the preview draws the padded strip inside the frame in the fill color', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const s = await state(page);
+      // The image's left edge now sits inside the frame, leaving a padded
+      // strip between the frame edge and the image.
+      expect(s.panX).toBeGreaterThan(s.box!.x + 3);
+      expect(s.fill).toEqual({ r: 255, g: 255, b: 255, a: 255 });
+      const p = await canvasPixel(page, s.box!.x + 1, 60);
+      expect(p).toEqual([255, 255, 255, 255]);
+    });
+
+    test('confirming a padded frame (auto-trim off) crops through the padding with the fill', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+      expect(Math.abs(crop.w - 263)).toBeLessThanOrEqual(1);
+      expect(Math.abs(crop.h - 263)).toBeLessThanOrEqual(1);
+      for (const c of crop.corners) expect(c).toEqual([255, 255, 255, 255]);
+      expect(Math.abs(crop.rect.sx - -12)).toBeLessThanOrEqual(1);
+      expect(crop.rect.sx).toBeLessThan(0);
+      expect(crop.fill?.a).toBe(255);
+    });
+
+    test('confirming a padded frame with auto-trim on trims to the subject and needs no fill', async ({ page }) => {
+      await setAutoTrim(page, true);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+      expect(crop.w).toBe(164);
+      expect(crop.h).toBe(164);
+      expect(crop.rect.sx).toBe(38);
+      expect(crop.rect.sy).toBe(38);
+      expect(crop.fill).toBeNull();
+    });
+
+    test('Edit crop on a padded crop reopens with the same rect, its padding, and the box on-canvas', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await drawPadBoxAndCenter(page);
+      const crop = await confirmAndReadCrop(page);
+
+      await page.locator('#edit-crop-btn').click();
+      await expect(page.locator('#select-wrap')).toBeVisible();
+      const s = await state(page);
+      expect(s.src).toEqual(crop.rect);
+      expect(s.pad).toEqual({ l: -crop.rect.sx, t: -crop.rect.sy, r: 0, b: 0 });
+      expect(s.fill).toEqual(crop.fill);
+      expect(s.box!.x).toBeGreaterThanOrEqual(-0.5);
+      expect(s.box!.y).toBeGreaterThanOrEqual(-0.5);
+      expect(s.box!.x + s.box!.w).toBeLessThanOrEqual(s.canvasW + 0.5);
+      expect(s.box!.y + s.box!.h).toBeLessThanOrEqual(s.canvasH + 0.5);
+    });
+
+    test('padding is shrink-only: pan-dragging after Center never grows it back', async ({ page }) => {
+      await drawPadBoxAndCenter(page);
+      const p0 = (await state(page)).pad;
+      expect(p0.l).toBeGreaterThan(0);
+      expect(p0.t).toBeGreaterThan(0);
+
+      // Image moves left/up 10/5 display px (~20/10 source px): the left
+      // padding is no longer needed at all, the top partly.
+      await dragOnCanvas(page, 100, 100, 90, 95);
+      const p1 = (await state(page)).pad;
+      for (const k of ['l', 'r', 't', 'b'] as const) expect(p1[k]).toBeLessThanOrEqual(p0[k]);
+      expect(p1.l).toBe(0);
+      // Shrunk to what the box still needs, not reset outright.
+      expect(p1.t).toBeGreaterThan(0);
+      expect(p1.t).toBeLessThan(p0.t);
+
+      // Dragging the image back right/down would need more padding than is
+      // left — it must clamp instead of re-granting it.
+      await dragOnCanvas(page, 90, 95, 130, 130);
+      const s2 = await state(page);
+      for (const k of ['l', 'r', 't', 'b'] as const) expect(s2.pad[k]).toBeLessThanOrEqual(p1[k]);
+      expect(s2.pad.l).toBe(0);
+      expect(s2.src!.sx).toBeGreaterThanOrEqual(0);
+      expect(s2.src!.sy).toBeGreaterThanOrEqual(-Math.ceil(p1.t));
+    });
+
+    for (const [name, act] of [
+      ['Clear', async (page: Page) => { await page.locator('#select-clear-btn').click(); }],
+      ['a new box drag', async (page: Page) => { await dragOnCanvas(page, 160, 160, 250, 250); }],
+      ['a re-upload via #file-input2', async (page: Page) => {
+        await page.locator('#file-input2').setInputFiles(SHEET_FIXTURE);
+        await expect(page.locator('#select-wrap')).toBeVisible();
+      }],
+    ] as const) {
+      test(`${name} after a padded Center resets the padding`, async ({ page }) => {
+        await drawPadBoxAndCenter(page);
+        expect((await state(page)).fill).not.toBeNull();
+        await act(page);
+        const s = await state(page);
+        expect(s.pad).toEqual({ l: 0, r: 0, t: 0, b: 0 });
+        expect(s.fill).toBeNull();
+      });
+    }
+
+    test('a frame that needs no padding still confirms to the plain in-image crop', async ({ page }) => {
+      await setAutoTrim(page, false);
+      await dragOnCanvas(page, 125, 125, 250, 250); // around the circle, clear of the edges
+      await page.locator('#select-center-btn').click();
+      const s = await state(page);
+      expect(s.pad).toEqual({ l: 0, r: 0, t: 0, b: 0 });
+      expect(s.fill).toBeNull();
+      const crop = await confirmAndReadCrop(page);
+      expect(crop.rect.sx).toBeGreaterThanOrEqual(0);
+      expect(crop.rect.sy).toBeGreaterThanOrEqual(0);
+      expect(crop.rect.sx + crop.rect.sw).toBeLessThanOrEqual(512);
+      expect(crop.rect.sy + crop.rect.sh).toBeLessThanOrEqual(512);
+      expect([crop.w, crop.h]).toEqual([crop.rect.sw, crop.rect.sh]);
+      expect(crop.fill).toBeNull();
+    });
+  });
+
+  test('on a dark background, padding is filled with the background color', async ({ page }) => {
+    await uploadGeneratedSheet(page, '#101010', '#ffffff');
+    await setAutoTrim(page, false);
+    await drawPadBoxAndCenter(page);
+    const s = await state(page);
+    expect(s.pad.l).toBeGreaterThan(0);
+    expect(s.fill).toEqual({ r: 16, g: 16, b: 16, a: 255 });
+    expect(await canvasPixel(page, s.box!.x + 1, 60)).toEqual([16, 16, 16, 255]);
+    const crop = await confirmAndReadCrop(page);
+    expect(crop.rect.sx).toBeLessThan(0);
+    for (const c of crop.corners) expect(c).toEqual([16, 16, 16, 255]);
+  });
+
+  test('on a transparent background, padding stays transparent and previews as a checker', async ({ page }) => {
+    await uploadGeneratedSheet(page, null, '#000000');
+    await setAutoTrim(page, false);
+    await drawPadBoxAndCenter(page);
+    const s = await state(page);
+    expect(s.pad.l).toBeGreaterThan(0);
+    expect(s.fill?.a).toBe(0);
+    // Preview: the padded strip shows one of the checker's two opaque tones
+    // (#3a3a40 / #2b2b30), not empty canvas.
+    const p = await canvasPixel(page, s.box!.x + 1, 60);
+    expect(p[3]).toBe(255);
+    expect([[58, 58, 64, 255], [43, 43, 48, 255]]).toContainEqual(p);
+    const crop = await confirmAndReadCrop(page);
+    expect(crop.rect.sx).toBeLessThan(0);
+    for (const c of crop.corners) expect(c[3]).toBe(0);
+  });
+});
+
 test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-finger pan)', () => {
   test.use({ hasTouch: true });
 
@@ -688,5 +945,106 @@ test.describe('selection UI — touch input (issue #23: pinch-to-zoom / two-fing
     await expect(page.locator('#select-rect')).toBeHidden();
     const zoomText = await page.locator('#select-zoom-readout').textContent();
     expect(parseInt(zoomText || '0', 10)).toBeGreaterThan(100);
+  });
+});
+
+test.describe('selection UI — touch input: touchcancel ends the gesture', () => {
+  test.use({ hasTouch: true });
+
+  // When the browser aborts a touch (system gesture, alert, palm rejection)
+  // it fires touchcancel and no touchend. Before the fix, select-canvas only
+  // listened for touchend, so the document-level touchmove listener and the
+  // drag/pinch state stayed live after a cancel: any later stray touchmove
+  // kept resizing the abandoned box or pinch-zooming the view. These tests
+  // drive real (CDP) touch input so the browser itself emits touchcancel.
+  type TP = { x: number; y: number; id?: number };
+
+  async function touchSession(page: Page) {
+    const cdp = await page.context().newCDPSession(page);
+    const cb = await canvasBox(page);
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd' | 'touchCancel', pts: TP[] = []) =>
+      cdp.send('Input.dispatchTouchEvent', {
+        type,
+        touchPoints: pts.map((p) => ({ x: cb.x + p.x, y: cb.y + p.y, id: p.id ?? 0 })),
+      });
+    return send;
+  }
+
+  // A stray touchmove reaching the document after the gesture should have
+  // ended — what a still-registered listener would wrongly act on.
+  async function strayDocumentTouchmove(page: Page, pts: { x: number; y: number }[]) {
+    await page.evaluate((pts) => {
+      const el = document.getElementById('select-canvas')!;
+      const r = el.getBoundingClientRect();
+      const touches = pts.map((p, i) => new Touch({ identifier: i + 1, target: el, clientX: r.left + p.x, clientY: r.top + p.y }));
+      document.dispatchEvent(new TouchEvent('touchmove', {
+        bubbles: true, cancelable: true, touches, targetTouches: touches, changedTouches: touches,
+      }));
+    }, pts);
+  }
+
+  const gestureState = (page: Page) =>
+    page.evaluate(() => ({ dragMode, dragOrigin, pinch: pinchState, zoom: viewZoom }));
+
+  test('touchcancel mid single-finger drag ends the drag; later touchmoves do not change the box', async ({ page }) => {
+    await uploadSheet(page);
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 20, y: 20 }]);
+    await send('touchMove', [{ x: 120, y: 120 }]);
+    expect((await gestureState(page)).dragMode).toBe('new');
+
+    await send('touchCancel');
+    const s = await gestureState(page);
+    expect(s.dragMode).toBeNull();
+    expect(s.dragOrigin).toBeNull();
+
+    const boxAfterCancel = await page.evaluate(() => (selectionBox ? { ...selectionBox } : null));
+    await strayDocumentTouchmove(page, [{ x: 240, y: 240 }]);
+    const boxAfterStray = await page.evaluate(() => (selectionBox ? { ...selectionBox } : null));
+    expect(boxAfterStray).toEqual(boxAfterCancel);
+  });
+
+  test('touchcancel during a two-finger pinch ends the pinch; later touchmoves do not zoom', async ({ page }) => {
+    await uploadSheet(page);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 110, y: 130, id: 1 }, { x: 150, y: 130, id: 2 }]);
+    const mid = await gestureState(page);
+    expect(mid.dragMode).toBe('touch-pinch');
+    expect(mid.pinch).not.toBeNull();
+
+    await send('touchCancel');
+    const s = await gestureState(page);
+    expect(s.pinch).toBeNull();
+    expect(s.dragMode).toBeNull();
+
+    // Fingers spreading 40px -> 160px would be a 4x pinch-out if a stale
+    // pinch listener were still attached.
+    await strayDocumentTouchmove(page, [{ x: 50, y: 130 }, { x: 210, y: 130 }]);
+    expect((await gestureState(page)).zoom).toBe(s.zoom);
+    await expect(page.locator('#select-zoom-readout')).toHaveText('100%');
+  });
+
+  test('after a cancelled pinch, a fresh one-finger touch starts a new box drag and leaves zoom alone', async ({ page }) => {
+    await uploadSheet(page);
+    const send = await touchSession(page);
+
+    await send('touchStart', [{ x: 110, y: 130, id: 1 }, { x: 150, y: 130, id: 2 }]);
+    await send('touchCancel');
+    const zoom0 = (await gestureState(page)).zoom;
+
+    await send('touchStart', [{ x: 20, y: 20, id: 3 }]);
+    await send('touchMove', [{ x: 100, y: 100, id: 3 }]);
+    expect((await gestureState(page)).dragMode).toBe('new');
+    await send('touchEnd');
+
+    const s = await gestureState(page);
+    expect(s.dragMode).toBeNull();
+    expect(s.pinch).toBeNull();
+    expect(s.zoom).toBe(zoom0);
+    await expect(page.locator('#select-rect')).toBeVisible();
+    await expect(page.locator('#select-confirm-btn')).toBeEnabled();
   });
 });

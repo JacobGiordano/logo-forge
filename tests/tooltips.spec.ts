@@ -51,7 +51,7 @@ async function moveToNeutral(page: Page) {
 
 test.describe('info popovers — desktop mouse', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     // Precondition: this describe block is only meaningful with a fine
     // pointer, where the hover layer is wired up.
     expect(await page.evaluate(() => window.matchMedia('(pointer: coarse)').matches)).toBe(false);
@@ -172,7 +172,7 @@ test.describe('info popovers — touch input', () => {
   test.use({ hasTouch: true });
 
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     // Precondition: the emulated device reports a coarse pointer, which is
     // what gates the hover layer off (isTouchPrimary in js/app.js). If this
     // ever stops being true the rest of the block would test nothing.
@@ -254,7 +254,7 @@ test.describe('info popover copy matches behavior', () => {
   }
 
   test('path-simplify tip describes point reduction on straight runs, and the slider does that', async ({ page }) => {
-    await page.goto('http://localhost:4321');
+    await page.goto('/');
     const copy = (await page.locator('#tip-path-simplify').textContent()) || '';
     expect(copy).toMatch(/reduces the number of points/i);
     expect(copy).toMatch(/straight/i);
