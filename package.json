@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "playwright test",
-    "serve": "serve . -l 4321"
+    "serve": "serve . -l 4321",
+    "start": "serve . -l 4321"
   },
   "repository": {
     "type": "git",
