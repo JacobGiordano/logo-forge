@@ -2331,6 +2331,29 @@ function buildMask(luminance, width, height, threshold, invert) {
 }
 
 function computeOtsuThreshold(hist, total) {
+  // Two-tone histogram (exactly two populated bins, e.g. a flat B&W export
+  // with no anti-aliasing): Otsu's between-class variance is identical for
+  // every t from the darker bin up to just below the lighter one, so the
+  // search below degenerates to the darker bin itself (then clamped to 1
+  // for pure black, per #19). At native resolution any threshold in
+  // (lo, hi] yields the same mask, but bilinear 2× interpolates grey edge
+  // pixels between the two tones, and a threshold hugging the ink tone
+  // drops them -- every shape loses ~0.5 source px per side. Use the
+  // midpoint between the two populations instead: the native mask is
+  // unchanged (no pixel sits between lo and hi) and interpolated edges
+  // split evenly. Histograms with anything between the tones take the
+  // normal Otsu search unchanged.
+  let lo = -1;
+  let hi = -1;
+  let populated = 0;
+  for (let i = 0; i < 256; i++) {
+    if (!hist[i]) continue;
+    populated++;
+    if (lo < 0) lo = i;
+    hi = i;
+  }
+  if (populated === 2) return clamp(Math.ceil((lo + hi) / 2), 1, 254);
+
   let sum = 0;
   for (let i = 0; i < 256; i++) sum += i * hist[i];
 
