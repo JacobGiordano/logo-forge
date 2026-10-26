@@ -192,9 +192,9 @@
           </div>
           <select id="upscale-factor">
             <option value="1">Off</option>
-            <option value="2">2×</option>
+            <option value="2" selected>2×</option>
           </select>
-          <p class="info-pop" id="tip-upscale-factor" role="tooltip" hidden>Bilinear-interpolates the source's continuous grayscale at 2× resolution and thresholds it there, instead of thresholding first and smoothing the binary mask afterward — this preserves true sub-pixel edge position for smoother, more accurate curves. Capped at 2× (higher factors aren't supported); very large images that would exceed the size limit automatically fall back to tracing at native resolution instead. Off skips this step.</p>
+          <p class="info-pop" id="tip-upscale-factor" role="tooltip" hidden>Bilinear-interpolates the source's continuous grayscale at 2× resolution and thresholds it there, instead of thresholding first and smoothing the binary mask afterward — this preserves true sub-pixel edge position for smoother, more accurate curves. Capped at 2× (higher factors aren't supported); very large images that would exceed the size limit, and small images (under 256px on their shorter side), automatically fall back to tracing at native resolution instead. Off skips this step.</p>
           <p class="advisory-note" id="supersample-advisory" aria-live="polite" hidden></p>
         </div>
         <div class="ctrl-row ctrl-row-select" style="margin-top:4px">

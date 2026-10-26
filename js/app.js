@@ -85,6 +85,15 @@ const BILINEAR_WORKER_TIMEOUT_MS = 20000;
 // the low-resolution corner case, it does not change normal-sized sources.
 const SMALL_SOURCE_DIM = 256;
 
+// The single definition of "small source" (issue #39's rule): strict "<" on
+// the native minimum dimension, so exactly 256 is NOT small. Shared by
+// smoothMask's vote relaxation and the 2× supersample skip below, so the
+// sources that get #39's small-image handling are exactly the ones that
+// trace at native resolution instead of being upscaled.
+function isSmallSource(width, height) {
+  return Math.min(width, height) < SMALL_SOURCE_DIM;
+}
+
 // Issue #39: same small-source scaling rationale as smoothMask above (see
 // SMALL_SOURCE_DIM's comment) — a fixed despeckleNative area threshold is
 // oversized relative to actual glyph-stroke geometry once native
@@ -548,7 +557,7 @@ function finalizeImage(img, dataUrl) {
   document.getElementById('trace-btn').disabled = false;
   updateEditCropButton();
   setStatus('Loaded ' + img.width + '×' + img.height + 'px — ready to trace');
-  updateSupersampleAdvisory(Math.max(img.width, img.height));
+  updateSupersampleAdvisory(img.width, img.height);
   autoDetect(img);
   scheduleLive();
 }
@@ -562,12 +571,17 @@ function finalizeImage(img, dataUrl) {
 // regardless of whether this note is read. Shown once native size reaches
 // either threshold, regardless of the current upscale-factor selection (the
 // control can be changed after upload without a new file load event, so
-// this can't be gated on the dropdown's value at call time).
-function updateSupersampleAdvisory(longestNativeDim) {
+// this can't be gated on the dropdown's value at call time). Small sources
+// (isSmallSource) get the same kind of note: they also skip 2× and trace at
+// native resolution, where #39's small-image smoothing applies.
+function updateSupersampleAdvisory(width, height) {
   const el = document.getElementById('supersample-advisory');
   if (!el) return;
-  if (longestNativeDim >= BILINEAR_NATIVE_SAFE_LIMIT) {
+  if (Math.max(width, height) >= BILINEAR_NATIVE_SAFE_LIMIT) {
     el.textContent = 'This image is large — 2× supersampling will be skipped and it will trace at native resolution.';
+    el.hidden = false;
+  } else if (isSmallSource(width, height)) {
+    el.textContent = 'This image is small — 2× supersampling will be skipped and it will trace at native resolution.';
     el.hidden = false;
   } else {
     el.hidden = true;
@@ -1964,7 +1978,13 @@ async function preprocessImageData(imgData, settings, invert) {
   // old 3×/4× Scale2x options are gone, and "2×" no longer means Scale2x at
   // all; it now requests the bilinear-presupersample mechanism below.
   const requestedUpscale = settings.upscaleFactor || 1;
-  const wantsBilinear = requestedUpscale === 2;
+  // Small sources (isSmallSource, issue #39's rule) never upscale: #39's
+  // relaxed smoothMask votes only run in the native pipeline, and at 2× the
+  // bilinear path deletes the 1px strokes that fix exists to keep. Treated
+  // as the expected outcome rather than a fallback, so there's no warn
+  // status — the pre-trace #supersample-advisory note covers it, and
+  // upscaleFactor comes back 1 so no Supersample chip renders.
+  const wantsBilinear = requestedUpscale === 2 && !isSmallSource(width, height);
 
   let bilinear = null;
   let fallbackMessage = null;
@@ -2311,6 +2331,29 @@ function buildMask(luminance, width, height, threshold, invert) {
 }
 
 function computeOtsuThreshold(hist, total) {
+  // Two-tone histogram (exactly two populated bins, e.g. a flat B&W export
+  // with no anti-aliasing): Otsu's between-class variance is identical for
+  // every t from the darker bin up to just below the lighter one, so the
+  // search below degenerates to the darker bin itself (then clamped to 1
+  // for pure black, per #19). At native resolution any threshold in
+  // (lo, hi] yields the same mask, but bilinear 2× interpolates grey edge
+  // pixels between the two tones, and a threshold hugging the ink tone
+  // drops them -- every shape loses ~0.5 source px per side. Use the
+  // midpoint between the two populations instead: the native mask is
+  // unchanged (no pixel sits between lo and hi) and interpolated edges
+  // split evenly. Histograms with anything between the tones take the
+  // normal Otsu search unchanged.
+  let lo = -1;
+  let hi = -1;
+  let populated = 0;
+  for (let i = 0; i < 256; i++) {
+    if (!hist[i]) continue;
+    populated++;
+    if (lo < 0) lo = i;
+    hi = i;
+  }
+  if (populated === 2) return clamp(Math.ceil((lo + hi) / 2), 1, 254);
+
   let sum = 0;
   for (let i = 0; i < 256; i++) sum += i * hist[i];
 
@@ -2360,7 +2403,7 @@ function smoothMask(mask, width, height, passes) {
   // cutoff, relax the survive vote (fewer neighbors needed to keep a thin
   // stroke pixel alive) and tighten the flip vote (more neighbors needed to
   // bridge a 1px gap into a false join) versus the normal-size defaults.
-  const small = Math.min(width, height) < SMALL_SOURCE_DIM;
+  const small = isSmallSource(width, height);
   const surviveAt = small ? 3 : 4;
   const flipAt = small ? 7 : 6;
   let current = mask;

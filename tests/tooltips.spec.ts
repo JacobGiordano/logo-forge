@@ -248,9 +248,14 @@ test.describe('info popover copy matches behavior', () => {
     });
   }
 
+  // Pinned Off: the "L runs only" / "C segments only" character of these
+  // two fixtures is a property of their native-resolution trace. Both are
+  // under 256px, so the 2x default skips them today anyway, but this test
+  // shouldn't silently start tracing upscaled if that rule changes.
   async function load(page: Page, fixture: string) {
     await page.locator('#file-input').setInputFiles(fixture);
     await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
+    await page.locator('#upscale-factor').selectOption('1');
   }
 
   test('path-simplify tip describes point reduction on straight runs, and the slider does that', async ({ page }) => {
