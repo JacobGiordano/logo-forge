@@ -49,11 +49,20 @@ import path from 'path';
 const SMALL_FIXTURE = path.resolve(__dirname, 'fixtures/thin-strokes-small.png');
 const NORMAL_FIXTURE = path.resolve(__dirname, 'fixtures/thin-strokes-normal.png');
 
-async function traceAndReadMaskPixels(page: Page, fixture: string, points: [number, number][]) {
+// `upscale` pins #upscale-factor before tracing; omit it to trace at the
+// app's default. The default is now 2x, and small sources (isSmallSource,
+// js/app.js) skip 2x on their own and trace natively -- so the small-fixture
+// tests below deliberately stay at the default: they exercise the real
+// upload-and-trace flow, and would fail if the small-source skip broke (the
+// bilinear path deletes these 1px strokes). Sources at/above 256px really
+// do run 2x by default, so any test reading native-resolution mask pixel
+// positions at that size must pin '1' (Off).
+async function traceAndReadMaskPixels(page: Page, fixture: string, points: [number, number][], upscale?: '1' | '2') {
   await page.goto('/');
   await page.locator('#file-input').setInputFiles(fixture);
   await expect(page.locator('#trace-btn')).toBeEnabled({ timeout: 3000 });
-  // Default settings throughout -- no sliders touched. cornerSmoothing
+  if (upscale) await page.locator('#upscale-factor').selectOption(upscale);
+  // Default settings otherwise -- no sliders touched. cornerSmoothing
   // defaults to 1 (index.html) so smoothMask's prePasses = max(1,
   // floor(1/2)) = 1 always runs even untouched, and despeckle defaults to
   // 24 -- this is deliberately the exact "did nothing special" repro shape
@@ -115,6 +124,11 @@ test.describe('small-source stroke survival and gap separation (issue #39)', () 
     await expect(page.locator('#svg-meta')).not.toContainText('Coverage: 0%');
     await expect(page.locator('#svg-meta')).not.toContainText('Paths: 0');
     await expect(page.locator('#svg-result')).toBeVisible();
+    // Upscale defaults to 2x, but this source is under SMALL_SOURCE_DIM, so
+    // the trace above must have run natively (no Supersample chip) -- that
+    // native path is where #39's relaxed votes apply.
+    await expect(page.locator('#upscale-factor')).toHaveValue('2');
+    await expect(page.locator('#svg-meta')).not.toContainText('Supersample');
   });
 });
 
@@ -136,7 +150,11 @@ test.describe('no regression at/above SMALL_SOURCE_DIM (issue #39 boundary)', ()
       ...rows.map((y): [number, number] => [128, y]), // stroke 2
     ];
 
-    const results = await traceAndReadMaskPixels(page, NORMAL_FIXTURE, points);
+    // Pinned Off: at exactly 256px the 2x default really runs (256 is not
+    // small), giving a 512x512 mask, and these points are native-resolution
+    // positions. This test is about the native smoothMask vote, so it must
+    // trace natively.
+    const results = await traceAndReadMaskPixels(page, NORMAL_FIXTURE, points, '1');
     const stroke1 = results.slice(0, rows.length);
     const gap = results.slice(rows.length, rows.length * 2);
     const stroke2 = results.slice(rows.length * 2);
